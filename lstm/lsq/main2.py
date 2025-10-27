@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import torch.nn.functional as F
 from torchvision import datasets, transforms
 
 
@@ -35,7 +35,6 @@ def train(model, epoch, loss_fn, optimizer, train_loader, use_cuda, log_interval
 
         optimizer.step()
 
-        #Print out the loss periodically.
         if batch_idx % log_interval == 0:
             print(
                 f'Train Epoch: {epoch} '
@@ -69,24 +68,12 @@ def test(model, loss_fn, optimizer, test_loader, use_cuda):
     return acc
 
 
-def train_and_eval(model, train_loader, test_loader, use_cuda, lr, epochs):
-    if use_cuda:
-        model.cuda()
-    history = []
-    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=255)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    for epoch in range(1, epochs + 1):
-        train(model, epoch, loss_fn, optimizer, train_loader)
-        acc = test(model, loss_fn, optimizer, test_loader)
-        history.append(acc)
-    return acc
-
-
 class Quantizer(nn.Module):
-    def __init__(self, bit, only_positive=False):
+    def __init__(self, bit, only_positive=False, per_tensor=False):
         super().__init__()
         self.bit = bit
         self.only_positive = only_positive
+        self.per_tensor = per_tensor
         if only_positive:
             self.thd_neg = 0
             self.thd_pos = 2 ** bit - 1
@@ -94,12 +81,20 @@ class Quantizer(nn.Module):
             self.thd_neg = -(2 ** (bit - 1))
             self.thd_pos = 2 ** (bit - 1) - 1
         self.s = nn.Parameter(torch.ones(1))
+        self.init_from_called = False
 
     def init_from(self, x):
-        s = (x.max() - x.min()) / (self.thd_pos - self.thd_neg )
-        self.s = nn.Parameter(s)
+        # s = (x.max() - x.min()) / (self.thd_pos - self.thd_neg)
+        # self.s = nn.Parameter(s)
+        self.init_from_called = True
+        if self.per_tensor:
+            self.s = nn.Parameter(x.detach().abs().mean() * 2 / (self.thd_pos ** 0.5))
+        else:
+            self.s = nn.Parameter(
+                x.detach().abs().mean(dim=1, keepdim=True) * 2 / (self.thd_pos ** 0.5)
+            )
 
-    def skip_grad_scale(self, x, scale):
+    def grad_scale(self, x, scale):
         y = x
         y_grad = x * scale
         return (y - y_grad).detach() + y_grad
@@ -110,14 +105,11 @@ class Quantizer(nn.Module):
         return (y - y_grad).detach() + y_grad
 
     def forward(self, x):
-        if self.bit >= 32:
-            return x
-
         s_grad_scale = 1.0 / ((self.thd_pos * x.numel()) ** 0.5)
 
-        s_scale = self.skip_grad_scale(self.s, s_grad_scale).to(x.device)
+        s_scale = self.grad_scale(self.s, s_grad_scale).to(x.device)
 
-        x = x / (s_scale)
+        x = x / s_scale
         x = torch.clamp(x, self.thd_neg, self.thd_pos)
         x = self.round_pass(x)
 
@@ -131,25 +123,29 @@ class QALinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.fc = nn.Linear(in_features, out_features, bias=True)
-        self.quantizer_act = Quantizer(bit, only_positive=only_positive_activations)
-        self.quantizer_weigh = Quantizer(bit)
-        self.quantizer_weigh.init_from(self.fc.weight)
-        self.quantizer_bias = Quantizer(bit)
+        self.quantizer_act = Quantizer(bit, only_positive=only_positive_activations, per_tensor=True)
+        self.quantizer_weight = Quantizer(bit, per_tensor=True)
+        self.quantizer_weight.init_from(self.fc.weight)
 
     def forward(self, input_x):
-        weight_q, weight_scale = self.quantizer_weigh(self.fc.weight)
+        # if not self.quantizer_weight.init_from_called:
+        #     self.quantizer_weight.init_from(self.fc.weight)
+        # if not self.quantizer_act.init_from_called:
+        #     self.quantizer_act.init_from(input_x)
+
+        weight_q, weight_scale = self.quantizer_weight(self.fc.weight)
         act_q, act_scale = self.quantizer_act(input_x)
-        bias_q, bias_scale = self.quantizer_bias(self.fc.bias)
-        return nn.functional.linear(
+
+        return F.linear(
             act_q * act_scale,
             weight_q * weight_scale,
-            bias=bias_q * bias_scale,
+            bias=self.fc.bias,
         )
 
 
 class LinearInt(nn.Linear):
-    def __init__(self, in_features, out_features, w_scale, b_scale, q_a, int_dtype, device='cpu'):
-        assert device=='cpu', "LinearInt8 only supports cpu"
+    def __init__(self, in_features, out_features, w_scale, q_a, int_dtype, device='cpu'):
+        assert device == 'cpu', "LinearInt only supports cpu"
         super().__init__(in_features, out_features, bias=True, device=device)
         self.weight.requires_grad = False
         self.weight.data = self.weight.data.to(int_dtype)
@@ -158,9 +154,14 @@ class LinearInt(nn.Linear):
         self.int_dtype = int_dtype
 
         self.w_scale = w_scale.to(device)
-        self.b_scale = b_scale.to(device)
-        self.quantizer_act = Quantizer(8, only_positive=q_a.only_positive).to(device)
-        self.quantizer_act.s = nn.Parameter(q_a.s.to(device) / 10)
+        if self.w_scale.dim() == 2:
+            self.w_scale = self.w_scale.T
+        self.quantizer_act = Quantizer(
+            torch.iinfo(int_dtype).bits,
+            only_positive=q_a.only_positive,
+            per_tensor=True,
+        ).to(device)
+        self.quantizer_act.s = nn.Parameter(q_a.s.to(device))
 
     def forward(self, input_x):
         act_q, act_scale = self.quantizer_act(input_x)
@@ -171,9 +172,8 @@ class LinearInt(nn.Linear):
     def from_quantized(cls, quantized_fc: QALinear, int_dtype):
         in_features = quantized_fc.in_features
         out_features = quantized_fc.out_features
-        weight_q, weight_scale = quantized_fc.quantizer_weigh(quantized_fc.fc.weight.data)
-        bias_q, bias_scale = quantized_fc.quantizer_bias(quantized_fc.fc.bias.data)
-        linear_int8 = cls(in_features, out_features, weight_scale, bias_scale, quantized_fc.quantizer_act, int_dtype)
+        weight_q, weight_scale = quantized_fc.quantizer_weight(quantized_fc.fc.weight.data)
+        linear_int8 = cls(in_features, out_features, weight_scale, quantized_fc.quantizer_act, int_dtype)
         linear_int8.weight.data = weight_q.to(int_dtype)
-        linear_int8.bias.data = bias_q.to(int_dtype)
+        linear_int8.bias.data = quantized_fc.fc.bias.data.to(int_dtype)
         return linear_int8
