@@ -181,7 +181,7 @@ class LinearInt(nn.Linear):
         return q_out * (act_scale * self.w_scale)
 
     @classmethod
-    def from_qat(cls, quantized_fc: QALinear, int_dtype: torch.dtype):
+    def from_qat(cls, quantized_fc: QALinear, int_dtype: torch.dtype) -> "LinearInt":
         in_features = quantized_fc.in_features
         out_features = quantized_fc.out_features
         weight_q, weight_scale = quantized_fc.quantizer_weight(quantized_fc.fc.weight.data)
