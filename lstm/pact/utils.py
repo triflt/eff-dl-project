@@ -80,7 +80,7 @@ class PACTQuantizer(nn.Module):
             scale = alpha / self.qmax
         else:
             # Clip to [0, alpha]
-            x_clipped = torch.clamp(x, min=0.0, max=alpha)
+            x_clipped = torch.clamp(x, min=torch.zeros_like(alpha), max=alpha)
             # Scale: alpha maps to qmax with zero-point 0
             scale = alpha / self.qmax
 
@@ -107,58 +107,98 @@ class QuantLinear(nn.Module):
         self,
         in_features: int,
         out_features: int,
-        bias: bool = True,
-        # Activation quantizer (PACT, typically unsigned)
-        act_bits: int = 8,
+        bit: int,
         use_act_quant: bool = True,
         act_init_alpha: float = 6.0,
-        # Weight quantizer (PACT-style symmetric)
-        weight_bits: int = 8,
-        use_weight_quant: bool = True,
         weight_per_channel: bool = True,
     ):
         super().__init__()
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.fc = nn.Linear(in_features, out_features, bias=True)
 
         self.use_act_quant = use_act_quant
-        self.use_weight_quant = use_weight_quant
 
         if use_act_quant:
             self.act_quant = PACTQuantizer(
-                n_bits=act_bits,
+                n_bits=bit,
                 signed=False,
                 init_alpha=act_init_alpha,
                 per_channel=False,
             )
 
-        if use_weight_quant:
-            # Per-output-channel (i.e., along out_features) often works best for weights
-            self.weight_quant = PACTQuantizer(
-                n_bits=weight_bits,
-                signed=True,
-                init_alpha=2.0,                  # a small start for weights; will adapt
-                per_channel=weight_per_channel,
-                channel_dim=0,                   # out_features dimension in [out, in]
-            )
+        # Per-output-channel (i.e., along out_features) often works best for weights
+        self.weight_quant = PACTQuantizer(
+            n_bits=bit,
+            signed=True,
+            init_alpha=2.0,                  # a small start for weights; will adapt
+            per_channel=weight_per_channel,
+            channel_dim=0,                   # out_features dimension in [out, in]
+        )
 
     def _quantize_weights(self):
-        W = self.linear.weight
+        W = self.fc.weight
         Wq, sw = self.weight_quant(W)
         return Wq, sw
 
     def forward(self, x: torch.Tensor):
-        scales = {}
 
         if self.use_act_quant:
             x, sa = self.act_quant(x)
-            scales["act_scale"] = sa
+            x = x * sa
 
-        if self.use_weight_quant:
-            Wq, sw = self._quantize_weights()
-            scales["weight_scale"] = sw
-        else:
-            Wq = self.linear.weight
+        Wq, sw = self._quantize_weights()
 
-        b = self.linear.bias
-        out = F.linear(x, Wq, b)
-        return out, scales
+        return F.linear(
+            x * sa,
+            Wq * sw,
+            bias=self.fc.bias,
+        )
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear, bit: int) -> "QuantLinear":
+        qa = cls(
+            linear.in_features,
+            linear.out_features,
+            bit,
+        )
+        qa.fc.weight = linear.weight
+        qa.fc.bias = linear.bias
+        qa.weight_quant._lazy_init_alpha(qa.fc.weight)
+        return qa
+
+
+class LinearInt(nn.Linear):
+    def __init__(self, in_features, out_features, w_scale, q_a, int_dtype, device='cpu'):
+        assert device == 'cpu', "LinearInt only supports cpu"
+        super().__init__(in_features, out_features, bias=True, device=device)
+        self.weight.requires_grad = False
+        self.weight.data = self.weight.data.to(int_dtype)
+        self.bias.requires_grad = False
+        self.bias.data = self.bias.data.to(int_dtype)
+        self.int_dtype = int_dtype
+
+        self.w_scale = w_scale.to(device)
+        if self.w_scale.dim() == 2:
+            self.w_scale = self.w_scale.T
+
+        self.quantizer_act = PACTQuantizer(
+            torch.iinfo(int_dtype).bits,
+            signed=q_a.signed,
+            per_channel=q_a.per_channel,
+            channel_dim=q_a.channel_dim,
+        ).to(device)
+        self.quantizer_act.alpha = nn.Parameter(q_a.alpha.to(device))
+
+    def forward(self, input_x):
+        act_q, act_scale = self.quantizer_act(input_x)
+        q_out = super().forward(act_q.to(self.int_dtype))
+        return q_out * (act_scale * self.w_scale)
+
+    @classmethod
+    def from_qat(cls, quantized_fc: QuantLinear, int_dtype: torch.dtype) -> "LinearInt":
+        in_features = quantized_fc.fc.in_features
+        out_features = quantized_fc.fc.out_features
+        weight_q, weight_scale = quantized_fc.weight_quant(quantized_fc.fc.weight.data)
+        linear_int = cls(in_features, out_features, weight_scale, quantized_fc.act_quant, int_dtype)
+        linear_int.weight.data = weight_q.to(int_dtype)
+        linear_int.bias.data = quantized_fc.fc.bias.data.to(int_dtype)
+        return linear_int

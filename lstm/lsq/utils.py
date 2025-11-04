@@ -142,7 +142,7 @@ class QALinear(nn.Module):
         )
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear, bit: int, only_positive_activations : bool = False) -> "QALinear":
+    def from_linear(cls, linear: nn.Linear, bit: int, only_positive_activations: bool = False) -> "QALinear":
         qa = cls(
             linear.in_features,
             linear.out_features,
@@ -185,7 +185,7 @@ class LinearInt(nn.Linear):
         in_features = quantized_fc.in_features
         out_features = quantized_fc.out_features
         weight_q, weight_scale = quantized_fc.quantizer_weight(quantized_fc.fc.weight.data)
-        linear_int8 = cls(in_features, out_features, weight_scale, quantized_fc.quantizer_act, int_dtype)
-        linear_int8.weight.data = weight_q.to(int_dtype)
-        linear_int8.bias.data = quantized_fc.fc.bias.data.to(int_dtype)
-        return linear_int8
+        linear_int = cls(in_features, out_features, weight_scale, quantized_fc.quantizer_act, int_dtype)
+        linear_int.weight.data = weight_q.to(int_dtype)
+        linear_int.bias.data = quantized_fc.fc.bias.data.to(int_dtype)
+        return linear_int
