@@ -50,13 +50,21 @@ class LSTMCell(nn.Module):
         return h_t, c_t
 
     def to_qat(self, bits: int, qat_linear_class, **qat_kwargs) -> "LSTMCell":
-        new_model = LSTMCell()
+        new_model = LSTMCell(
+            input_size=self.input_size,
+            hidden_size=self.hidden_size,
+            bias=self.linear.bias is not None,
+        )
         new_model.linear = qat_linear_class.from_linear(self.linear, bits, **qat_kwargs)
         return new_model
 
     def quantize(self, bits: int, linear_int_class) -> "LSTMCell":
         int_dtype = bits_to_dtype[bits]
-        new_model = LSTMCell()
+        new_model = LSTMCell(
+            input_size=self.input_size,
+            hidden_size=self.hidden_size,
+            bias=self.linear.fc.bias is not None,
+        )
         new_model.linear = linear_int_class.from_qat(self.linear, int_dtype)
         return new_model
 
@@ -100,11 +108,21 @@ class LSTM(nn.Module):
         return outputs, (h_t, c_t)
 
     def to_qat(self, bits: int, qat_linear_class, **qat_kwargs) -> "LSTM":
-        new_model = LSTM()
-        new_model.cell = new_model.cell.to_qat(bits, qat_linear_class, **qat_kwargs)
+        new_model = LSTM(
+            input_size=self.cell.input_size,
+            hidden_size=self.cell.hidden_size,
+            bias=self.cell.linear.bias is not None,
+            batch_first=self.batch_first,
+        )
+        new_model.cell = self.cell.to_qat(bits, qat_linear_class, **qat_kwargs)
         return new_model
 
     def quantize(self, bits: int, linear_int_class) -> "LSTM":
-        new_model = LSTM()
-        new_model.cell = new_model.cell.to_qat(bits, linear_int_class)
+        new_model = LSTM(
+            input_size=self.cell.input_size,
+            hidden_size=self.cell.hidden_size,
+            bias=self.cell.linear.fc.bias is not None,
+            batch_first=self.batch_first,
+        )
+        new_model.cell = self.cell.quantize(bits, linear_int_class)
         return new_model
