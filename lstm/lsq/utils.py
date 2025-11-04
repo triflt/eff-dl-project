@@ -39,7 +39,7 @@ def train(model, epoch, loss_fn, optimizer, train_loader, use_cuda, log_interval
             print(
                 f'Train Epoch: {epoch} '
                 f'[{batch_idx * len(data)}/{len(train_loader.dataset)} '
-                f'({100. * batch_idx / len(train_loader):.0f}%)]'
+                f'({100. * batch_idx / len(train_lo        self.fc'
                 f'\tLoss: {loss.item():.6f}'
             )
 
@@ -117,7 +117,7 @@ class Quantizer(nn.Module):
 
 
 class QALinear(nn.Module):
-    def __init__(self, in_features, out_features, bit: int, only_positive_activations : bool = False):
+    def __init__(self, in_features, out_features, bit: int, only_positive_activations: bool = False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
