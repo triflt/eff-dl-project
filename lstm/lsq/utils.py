@@ -117,9 +117,8 @@ class Quantizer(nn.Module):
 
 
 class QALinear(nn.Module):
-    def __init__(self, in_features, out_features, bit, only_positive_activations=False):
+    def __init__(self, in_features, out_features, bit: int, only_positive_activations : bool = False):
         super().__init__()
-        self.bit = bit
         self.in_features = in_features
         self.out_features = out_features
         self.fc = nn.Linear(in_features, out_features, bias=True)
@@ -141,6 +140,20 @@ class QALinear(nn.Module):
             weight_q * weight_scale,
             bias=self.fc.bias,
         )
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear, bit: int, only_positive_activations : bool = False) -> "QALinear":
+        qa = cls(
+            linear.in_features,
+            linear.out_features,
+            bit,
+            only_positive_activations,
+        )
+        qa.fc.weight = linear.weight
+        qa.fc.bias = linear.bias
+        qa.quantizer_weight.init_from(qa.fc.weight)
+        return qa
+
 
 
 class LinearInt(nn.Linear):
@@ -169,7 +182,7 @@ class LinearInt(nn.Linear):
         return q_out * (act_scale * self.w_scale)
 
     @classmethod
-    def from_quantized(cls, quantized_fc: QALinear, int_dtype):
+    def from_quantized(cls, quantized_fc: QALinear, int_dtype: torch.dtype):
         in_features = quantized_fc.in_features
         out_features = quantized_fc.out_features
         weight_q, weight_scale = quantized_fc.quantizer_weight(quantized_fc.fc.weight.data)
