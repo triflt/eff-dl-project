@@ -19,6 +19,7 @@ from torch import nn
 from torch import optim
 from contextlib import nullcontext
 from torch.optim import lr_scheduler
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -46,18 +47,41 @@ def main():
     criterion = define_loss()
     print("Define all loss functions successfully.")
 
-    optimizer = define_optimizer(espcn_model)
-    print("Define all optimizer functions successfully.")
-
-    scheduler = define_scheduler(optimizer)
-    print("Define all optimizer scheduler successfully.")
+    optimizer = None
+    scheduler = None
 
     print("Check whether to load pretrained model weights...")
     if config.pretrained_model_weights_path:
-        espcn_model = load_state_dict(espcn_model, config.pretrained_model_weights_path, load_mode="pretrained")
-        print(f"Loaded `{config.pretrained_model_weights_path}` pretrained model weights successfully.")
+        # If QAT is enabled, load FP32 checkpoint into FP32 model and copy into QAT model
+        if getattr(config, "qat_enabled", False):
+            # Build FP32 model temporarily
+            prev_qat = config.qat_enabled
+            config.qat_enabled = False
+            fp32_model = build_model()
+            fp32_model = load_state_dict(fp32_model, config.pretrained_model_weights_path, load_mode="pretrained")
+            # Restore QAT flag and rebuild QAT model fresh
+            config.qat_enabled = prev_qat
+            espcn_model = build_model()
+            # Copy conv weights from FP32 into QAT inner convs
+            _copy_fp32_to_qat(fp32_model, espcn_model)
+            # Recreate optimizer/scheduler bound to the new model
+            optimizer = define_optimizer(espcn_model)
+            scheduler = define_scheduler(optimizer)
+            print(f"Loaded FP32 pretrained weights into QAT model from `{config.pretrained_model_weights_path}`.")
+        else:
+            espcn_model = load_state_dict(espcn_model, config.pretrained_model_weights_path, load_mode="pretrained")
+            optimizer = define_optimizer(espcn_model)
+            scheduler = define_scheduler(optimizer)
+            print(f"Loaded `{config.pretrained_model_weights_path}` pretrained model weights successfully.")
     else:
         print("Pretrained model weights not found.")
+        # Create optimizer/scheduler if not yet created
+        if optimizer is None:
+            optimizer = define_optimizer(espcn_model)
+            print("Define all optimizer functions successfully.")
+        if scheduler is None:
+            scheduler = define_scheduler(optimizer)
+            print("Define all optimizer scheduler successfully.")
 
     print("Check whether the pretrained model is restored...")
     if config.resume_model_weights_path:
@@ -142,6 +166,26 @@ def main():
                         is_best,
                         is_last)
 
+def _copy_fp32_to_qat(fp32_model: nn.Module, qat_model: nn.Module) -> None:
+    """Copy Conv2d weights/bias from FP32 ESPCN into QAT-wrapped ESPCN (inner conv)."""
+    # Flatten conv modules in order for both models
+    def list_convs(module: nn.Module):
+        return [m for m in module.modules() if isinstance(m, nn.Conv2d)]
+    def list_qconvs(module: nn.Module):
+        # QAConv2d has attribute `conv` which is nn.Conv2d
+        qconvs = []
+        for m in module.modules():
+            if hasattr(m, "conv") and isinstance(getattr(m, "conv"), nn.Conv2d):
+                qconvs.append(getattr(m, "conv"))
+        return qconvs
+    fp32_convs = list_convs(fp32_model)
+    qat_inner_convs = list_qconvs(qat_model)
+    num = min(len(fp32_convs), len(qat_inner_convs))
+    with torch.no_grad():
+        for i in range(num):
+            qat_inner_convs[i].weight.copy_(fp32_convs[i].weight)
+            if fp32_convs[i].bias is not None and qat_inner_convs[i].bias is not None:
+                qat_inner_convs[i].bias.copy_(fp32_convs[i].bias)
 
 def load_dataset() -> [CUDAPrefetcher | CPUPrefetcher, CUDAPrefetcher | CPUPrefetcher]:
     # Load train, test and valid datasets
@@ -257,6 +301,21 @@ def train(
         with autocast():
             sr = espcn_model(lr)
             loss = torch.mul(config.loss_weights, criterion(sr, gt))
+            # PACT alpha regularization (canonical)
+            if getattr(config, "qat_enabled", False) and getattr(config, "qat_method", "") == "pact":
+                alpha_reg = float(getattr(config, "pact_alpha_reg", 0.0) or 0.0)
+                if alpha_reg > 0.0:
+                    reg_term = 0.0
+                    # Import locally to avoid hard dependency when not using PACT
+                    try:
+                        from pact.quant import PACTQuantizer
+                        for m in espcn_model.modules():
+                            if isinstance(m, PACTQuantizer):
+                                reg_term = reg_term + F.softplus(m.alpha).pow(2).sum()
+                    except Exception:
+                        reg_term = 0.0
+                    if isinstance(reg_term, torch.Tensor):
+                        loss = loss + alpha_reg * reg_term
 
         # Backpropagation
         scaler.scale(loss).backward()

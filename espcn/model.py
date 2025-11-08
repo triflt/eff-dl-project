@@ -15,6 +15,7 @@ import math
 
 import torch
 from torch import nn, Tensor
+import config
 
 __all__ = [
     "ESPCN",
@@ -35,18 +36,38 @@ class ESPCN(nn.Module):
         out_channels = int(out_channels * (upscale_factor ** 2))
 
         # Feature mapping
-        self.feature_maps = nn.Sequential(
+        feature_layers = [
             nn.Conv2d(in_channels, channels, (5, 5), (1, 1), (2, 2)),
             nn.Tanh(),
             nn.Conv2d(channels, hidden_channels, (3, 3), (1, 1), (1, 1)),
             nn.Tanh(),
-        )
+        ]
 
         # Sub-pixel convolution layer
-        self.sub_pixel = nn.Sequential(
+        subpixel_layers = [
             nn.Conv2d(hidden_channels, out_channels, (3, 3), (1, 1), (1, 1)),
             nn.PixelShuffle(upscale_factor),
-        )
+        ]
+
+        if getattr(config, "qat_enabled", False):
+            method = getattr(config, "qat_method", "lsq")
+            bits = getattr(config, "qat_bits", 8)
+            quant_act = getattr(config, "qat_quantize_activations", True)
+            if method == "lsq":
+                from lsq.quant import QAConv2d as QAConv2d_LSQ
+                from lsq.quant import QuantAct as QuantAct_LSQ
+                feature_layers = _quantize_layers(feature_layers, QAConv2d_LSQ, QuantAct_LSQ, bits, quant_act)
+                subpixel_layers = _quantize_layers(subpixel_layers, QAConv2d_LSQ, QuantAct_LSQ, bits, quant_act, insert_act_before_pixelshuffle=True)
+            elif method == "pact":
+                from pact.quant import QAConv2d as QAConv2d_PACT
+                from pact.quant import QuantAct as QuantAct_PACT
+                feature_layers = _quantize_layers(feature_layers, QAConv2d_PACT, QuantAct_PACT, bits, quant_act)
+                subpixel_layers = _quantize_layers(subpixel_layers, QAConv2d_PACT, QuantAct_PACT, bits, quant_act, insert_act_before_pixelshuffle=True)
+            else:
+                raise ValueError(f"Unsupported QAT method: {method}")
+
+        self.feature_maps = nn.Sequential(*feature_layers)
+        self.sub_pixel = nn.Sequential(*subpixel_layers)
 
         # Initial model weights
         for module in self.modules():
@@ -74,6 +95,30 @@ class ESPCN(nn.Module):
 
         return x
 
+
+def _quantize_layers(layers, QAConv2dCls, QuantActCls, bits: int, quantize_activation: bool, insert_act_before_pixelshuffle: bool = False):
+    """Replace Conv2d with QAConv2d and insert activation quantization after Tanh (and before PixelShuffle if requested)."""
+    new_layers = []
+    for i, layer in enumerate(layers):
+        if isinstance(layer, nn.Conv2d):
+            qconv = QAConv2dCls(layer.in_channels, layer.out_channels, layer.kernel_size, layer.stride, layer.padding, layer.bias is not None, bit=bits, quantize_activation=False)
+            # copy weights
+            with torch.no_grad():
+                qconv.conv.weight.copy_(layer.weight)
+                if layer.bias is not None:
+                    qconv.conv.bias.copy_(layer.bias)
+            new_layers.append(qconv)
+        elif isinstance(layer, nn.Tanh):
+            new_layers.append(layer)
+            if quantize_activation:
+                new_layers.append(QuantActCls(bits))
+        elif isinstance(layer, nn.PixelShuffle):
+            if insert_act_before_pixelshuffle and quantize_activation:
+                new_layers.append(QuantActCls(bits))
+            new_layers.append(layer)
+        else:
+            new_layers.append(layer)
+    return new_layers
 
 def espcn_x2(**kwargs) -> ESPCN:
     model = ESPCN(upscale_factor=2, **kwargs)
