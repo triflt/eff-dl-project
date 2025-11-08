@@ -39,7 +39,7 @@ def train(model, epoch, loss_fn, optimizer, train_loader, use_cuda, log_interval
             print(
                 f'Train Epoch: {epoch} '
                 f'[{batch_idx * len(data)}/{len(train_loader.dataset)} '
-                f'({100. * batch_idx / len(train_lo        self.fc'
+                f'({100. * batch_idx / len(train_loader):.0f}%)]'
                 f'\tLoss: {loss.item():.6f}'
             )
 
@@ -51,7 +51,6 @@ def test(model, loss_fn, optimizer, test_loader, use_cuda):
     for data, target in test_loader:
         if use_cuda:
             data, target = data.cuda(), target.cuda()
-        #data, target = Variable(data, volatile=True), Variable(target)
         output = model(data)
         test_loss += loss_fn(output, target).item() # sum up batch loss
         pred = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
@@ -84,8 +83,6 @@ class Quantizer(nn.Module):
         self.init_from_called = False
 
     def init_from(self, x):
-        # s = (x.max() - x.min()) / (self.thd_pos - self.thd_neg)
-        # self.s = nn.Parameter(s)
         self.init_from_called = True
         if self.per_tensor:
             self.s = nn.Parameter(x.detach().abs().mean() * 2 / (self.thd_pos ** 0.5))
@@ -149,8 +146,10 @@ class QALinear(nn.Module):
             bit,
             only_positive_activations,
         )
-        qa.fc.weight = linear.weight
-        qa.fc.bias = linear.bias
+        qa.to(linear.weight.device)
+        with torch.no_grad():
+            qa.fc.weight.copy_(linear.weight)
+            qa.fc.bias.copy_(linear.bias)
         qa.quantizer_weight.init_from(qa.fc.weight)
         return qa
 
@@ -177,7 +176,7 @@ class LinearInt(nn.Linear):
 
     def forward(self, input_x):
         act_q, act_scale = self.quantizer_act(input_x)
-        q_out = super().forward(act_q.to(self.int_dtype))
+        q_out = torch._int_mm(act_q.to(self.int_dtype), self.weight.T) + self.bias
         return q_out * (act_scale * self.w_scale)
 
     @classmethod

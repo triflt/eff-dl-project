@@ -160,8 +160,10 @@ class QuantLinear(nn.Module):
             linear.out_features,
             bit,
         )
-        qa.fc.weight = linear.weight
-        qa.fc.bias = linear.bias
+        qa.to(linear.weight.device)
+        with torch.no_grad():
+            qa.fc.weight.copy_(linear.weight)
+            qa.fc.bias.copy_(linear.bias)
         qa.weight_quant._lazy_init_alpha(qa.fc.weight)
         return qa
 
@@ -190,7 +192,7 @@ class LinearInt(nn.Linear):
 
     def forward(self, input_x):
         act_q, act_scale = self.quantizer_act(input_x)
-        q_out = super().forward(act_q.to(self.int_dtype))
+        q_out = torch._int_mm(act_q.to(self.int_dtype), self.weight.T) + self.bias
         return q_out * (act_scale * self.w_scale)
 
     @classmethod
