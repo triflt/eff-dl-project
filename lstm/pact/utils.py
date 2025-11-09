@@ -88,10 +88,11 @@ class PACTQuantizer(nn.Module):
         eps = torch.finfo(x.dtype).eps
         scale_safe = torch.clamp(scale, min=eps)
 
-        # Fake-quantization with STE
-        y = torch.round(x_clipped / scale_safe) * scale_safe
+        # Fake-quantization with straight-through gradients (return values before scaling back)
+        scaled = x_clipped / scale_safe
+        q = torch.round(scaled).clamp_(self.qmin, self.qmax)
+        y = scaled + (q - scaled).detach()
 
-        # Detach scale from graph for returning
         return y, scale_safe.detach()
 
 
@@ -141,15 +142,15 @@ class QuantLinear(nn.Module):
 
     def forward(self, x: torch.Tensor):
 
+        scale_act = 1.0
         if self.use_act_quant:
-            x, sa = self.act_quant(x)
-            x = x * sa
+            x, scale_act = self.act_quant(x)
 
-        Wq, sw = self._quantize_weights()
+        Wq, scale_w = self._quantize_weights()
 
         return F.linear(
-            x * sa,
-            Wq * sw,
+            x * scale_act,
+            Wq * scale_w,
             bias=self.fc.bias,
         )
 
@@ -172,35 +173,60 @@ class LinearInt(nn.Linear):
     def __init__(self, in_features, out_features, w_scale, q_a, int_dtype, device='cpu'):
         assert device == 'cpu', "LinearInt only supports cpu"
         super().__init__(in_features, out_features, bias=True, device=device)
-        self.weight.requires_grad = False
-        self.weight.data = self.weight.data.to(int_dtype)
-        self.bias.requires_grad = False
-        self.bias.data = self.bias.data.to(int_dtype)
         self.int_dtype = int_dtype
 
-        self.w_scale = w_scale.to(device)
-        if self.w_scale.dim() == 2:
-            self.w_scale = self.w_scale.T
+        self.weight.requires_grad = False
+        self.bias.requires_grad = False
 
-        self.quantizer_act = PACTQuantizer(
-            torch.iinfo(int_dtype).bits,
-            signed=q_a.signed,
-            per_channel=q_a.per_channel,
-            channel_dim=q_a.channel_dim,
-        ).to(device)
-        self.quantizer_act.alpha = nn.Parameter(q_a.alpha.to(device))
+        w_scale = w_scale.to(device)
+        if w_scale.dim() == 0:
+            w_scale = w_scale.reshape(1, 1)
+        elif w_scale.dim() == 1:
+            w_scale = w_scale.unsqueeze(0)
+        else:
+            w_scale = w_scale.reshape(1, -1)
+        self.register_buffer("w_scale", w_scale.float())
+
+        self.quantizer_act = None
+        if q_a is not None:
+            self.quantizer_act = PACTQuantizer(
+                torch.iinfo(int_dtype).bits,
+                signed=q_a.signed,
+                per_channel=q_a.per_channel,
+                channel_dim=q_a.channel_dim,
+            ).to(device)
+            alpha = q_a.alpha.detach().clone().to(device)
+            self.quantizer_act.alpha = nn.Parameter(alpha, requires_grad=False)
 
     def forward(self, input_x):
+        if input_x.device.type != 'cpu':
+            input_x = input_x.cpu()
+
+        if self.quantizer_act is None:
+            raise RuntimeError("Activation quantizer is not initialized.")
+
         act_q, act_scale = self.quantizer_act(input_x)
-        q_out = torch._int_mm(act_q.to(self.int_dtype), self.weight.T) + self.bias
-        return q_out * (act_scale * self.w_scale)
+        act_int = act_q.clamp_(self.quantizer_act.qmin, self.quantizer_act.qmax)
+        act_int = act_int.to(self.int_dtype).contiguous()
+
+        weight_int = self.weight.to(self.int_dtype).contiguous()
+        q_out = torch._int_mm(act_int, weight_int.T).to(torch.int32)
+
+        scale = act_scale * self.w_scale
+        out = q_out.to(torch.float32) * scale
+        return out + self.bias
 
     @classmethod
     def from_qat(cls, quantized_fc: QuantLinear, int_dtype: torch.dtype) -> "LinearInt":
         in_features = quantized_fc.fc.in_features
         out_features = quantized_fc.fc.out_features
         weight_q, weight_scale = quantized_fc.weight_quant(quantized_fc.fc.weight.data)
-        linear_int = cls(in_features, out_features, weight_scale, quantized_fc.act_quant, int_dtype)
-        linear_int.weight.data = weight_q.to(int_dtype)
-        linear_int.bias.data = quantized_fc.fc.bias.data.to(int_dtype)
+        act_quant = quantized_fc.act_quant if getattr(quantized_fc, "use_act_quant", False) else None
+        linear_int = cls(in_features, out_features, weight_scale, act_quant, int_dtype)
+        weight_int = weight_q.clamp_(
+            quantized_fc.weight_quant.qmin,
+            quantized_fc.weight_quant.qmax,
+        ).to(int_dtype)
+        linear_int.weight.data = weight_int.to(linear_int.weight.dtype)
+        linear_int.bias.data = quantized_fc.fc.bias.detach().to(linear_int.bias.dtype)
         return linear_int
