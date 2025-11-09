@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class PACTQuantizer(nn.Module):
+class Quantizer(nn.Module):
     """
     PACT (Parameterized Clipping Activation) quantizer.
 
@@ -119,7 +119,7 @@ class QuantLinear(nn.Module):
         self.use_act_quant = use_act_quant
 
         if use_act_quant:
-            self.act_quant = PACTQuantizer(
+            self.act_quant = Quantizer(
                 n_bits=bit,
                 signed=False,
                 init_alpha=act_init_alpha,
@@ -127,7 +127,7 @@ class QuantLinear(nn.Module):
             )
 
         # Per-output-channel (i.e., along out_features) often works best for weights
-        self.weight_quant = PACTQuantizer(
+        self.weight_quant = Quantizer(
             n_bits=bit,
             signed=True,
             init_alpha=2.0,                  # a small start for weights; will adapt
@@ -189,7 +189,7 @@ class LinearInt(nn.Linear):
 
         self.quantizer_act = None
         if q_a is not None:
-            self.quantizer_act = PACTQuantizer(
+            self.quantizer_act = Quantizer(
                 torch.iinfo(int_dtype).bits,
                 signed=q_a.signed,
                 per_channel=q_a.per_channel,

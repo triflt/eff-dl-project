@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class AdaRoundQuantizer(nn.Module):
+class Quantizer(nn.Module):
     """
     Minimal AdaRound-style quantizer.
     - Learns rounding offsets (alpha) while keeping scale deterministic by default.
@@ -99,7 +99,7 @@ class AdaRoundQuantizer(nn.Module):
         return x_q, scale
 
 
-class AdaRoundLinear(nn.Module):
+class QuantLinear(nn.Module):
     """
     Linear layer that quantizes its WEIGHTS with AdaRoundQuantizer.
     Forward returns ONLY the output (no scales), as requested.
@@ -109,7 +109,7 @@ class AdaRoundLinear(nn.Module):
         super().__init__()
         self.fc = nn.Linear(in_features, out_features, bias=True)
         # Per-output-channel quantization is standard for linear/conv weights
-        self.quantizer = AdaRoundQuantizer(
+        self.quantizer = Quantizer(
             bit=bit, per_channel=per_channel, ch_axis=0, symmetric=symmetric
         )
 
@@ -119,7 +119,7 @@ class AdaRoundLinear(nn.Module):
         return F.linear(x, w_q, self.fc.bias)
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear, bit: int) -> "AdaRoundLinear":
+    def from_linear(cls, linear: nn.Linear, bit: int) -> "QuantLinear":
         qa = cls(
             linear.in_features,
             linear.out_features,
@@ -145,7 +145,7 @@ class LinearInt(nn.Linear):
         if w_scale.dim() == 2:
             w_scale = w_scale.T
         self.register_buffer("w_scale", w_scale)
-        self.quantizer_act = AdaRoundQuantizer(
+        self.quantizer_act = Quantizer(
             torch.iinfo(int_dtype).bits,
             per_channel=False,
         ).to(device)
@@ -156,7 +156,7 @@ class LinearInt(nn.Linear):
         return q_out * (act_scale * self.w_scale)
 
     @classmethod
-    def from_qat(cls, quantized_fc: AdaRoundLinear, int_dtype: torch.dtype) -> "LinearInt":
+    def from_qat(cls, quantized_fc: QuantLinear, int_dtype: torch.dtype) -> "LinearInt":
         in_features = quantized_fc.fc.in_features
         out_features = quantized_fc.fc.out_features
         weight_q, weight_scale = quantized_fc.quantizer(

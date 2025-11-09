@@ -10,9 +10,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, random_split
 
 from lstm import LSTMClassifier
-# from lsq.utils import QALinear, LinearInt
-# from pact.utils import QuantLinear, LinearInt
-from adaround.utils import AdaRoundLinear, LinearInt
+# from lsq import QuantLinear, LinearInt
+# from pact import QuantLinear, LinearInt
+from adaround import QuantLinear, LinearInt
 
 DATA_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/00228/smsspamcollection.zip"
 DATA_DIR = "./data"
@@ -189,7 +189,7 @@ print(f"Epoch {1:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | 
 print('\n\n\n')
 
 
-model_qat = model.to_qat(bits=8, qat_linear_class=AdaRoundLinear)
+model_qat = model.to_qat(bits=8, qat_linear_class=QuantLinear)
 optimizer_qa = torch.optim.Adam(model_qat.parameters(), lr=1e-2)
 
 for i in range(5):

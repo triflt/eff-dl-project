@@ -1,70 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import datasets, transforms
-
-
-def get_mnist(batch_size, train=True):
-    return torch.utils.data.DataLoader(
-        datasets.MNIST(
-            '../data',
-            train=train,
-            download=True,
-            transform=transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize((0.1307,), (0.3081,)),
-            ]),
-        ),
-        batch_size=batch_size,
-        shuffle=True,
-    )
-
-
-def train(model, epoch, loss_fn, optimizer, train_loader, use_cuda, log_interval):
-    model.train()
-    for batch_idx, (data, target) in enumerate(train_loader):
-        if use_cuda:
-            data, target = data.cuda(), target.cuda()
-
-        optimizer.zero_grad()
-        output = model(data)
-
-        loss = loss_fn(output, target)
-
-        loss.backward()
-
-        optimizer.step()
-
-        if batch_idx % log_interval == 0:
-            print(
-                f'Train Epoch: {epoch} '
-                f'[{batch_idx * len(data)}/{len(train_loader.dataset)} '
-                f'({100. * batch_idx / len(train_loader):.0f}%)]'
-                f'\tLoss: {loss.item():.6f}'
-            )
-
-
-def test(model, loss_fn, optimizer, test_loader, use_cuda):
-    model.eval()
-    test_loss = 0
-    correct = 0
-    for data, target in test_loader:
-        if use_cuda:
-            data, target = data.cuda(), target.cuda()
-        output = model(data)
-        test_loss += loss_fn(output, target).item() # sum up batch loss
-        pred = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
-        correct += pred.eq(target.data.view_as(pred)).long().cpu().sum()
-
-    test_loss /= len(test_loader.dataset)
-    acc = 100. * correct / len(test_loader.dataset)
-    print(
-        f'\nTest set: Average loss: {test_loss:.4f}, '
-        f'Accuracy: {correct}/{len(test_loader.dataset)} '
-        f'({acc:.0f}%)\n'
-    )
-
-    return acc
 
 
 class Quantizer(nn.Module):
@@ -113,7 +49,7 @@ class Quantizer(nn.Module):
         return x, s_scale
 
 
-class QALinear(nn.Module):
+class QuantLinear(nn.Module):
     def __init__(self, in_features, out_features, bit: int, only_positive_activations: bool = False):
         super().__init__()
         self.in_features = in_features
@@ -139,7 +75,7 @@ class QALinear(nn.Module):
         )
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear, bit: int, only_positive_activations: bool = False) -> "QALinear":
+    def from_linear(cls, linear: nn.Linear, bit: int, only_positive_activations: bool = False) -> "QuantLinear":
         qa = cls(
             linear.in_features,
             linear.out_features,
@@ -179,7 +115,7 @@ class LinearInt(nn.Linear):
         return q_out * (act_scale * self.w_scale)
 
     @classmethod
-    def from_qat(cls, quantized_fc: QALinear, int_dtype: torch.dtype) -> "LinearInt":
+    def from_qat(cls, quantized_fc: QuantLinear, int_dtype: torch.dtype) -> "LinearInt":
         in_features = quantized_fc.in_features
         out_features = quantized_fc.out_features
         weight_q, weight_scale = quantized_fc.quantizer_weight(quantized_fc.fc.weight.data)
