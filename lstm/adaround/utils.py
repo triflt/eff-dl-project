@@ -61,7 +61,14 @@ class AdaRoundQuantizer(nn.Module):
             s = maxv / self.qmax if self.symmetric else maxv / self.qmax
             return torch.clamp(s, min=1e-8)
 
-    def forward(self, x):
+    def _round_offset(self, hard: bool) -> torch.Tensor:
+        s = torch.sigmoid(self.alpha) * (self.zeta - self.gamma) + self.gamma
+        s = torch.clamp(s, 0.0, 1.0)
+        if hard:
+            return (s >= 0.5).to(s.dtype)
+        return s
+
+    def forward(self, x, hard: bool = False, return_int: bool = False):
         """
         Returns:
             x_q: quantized tensor (same shape as x)
@@ -78,11 +85,15 @@ class AdaRoundQuantizer(nn.Module):
         # x_int = floor(x/scale) + r, then clamp to [qmin, qmax]
         x_s = x / scale
         x_floor = torch.floor(x_s)
-        s = torch.sigmoid(self.alpha) * (self.zeta - self.gamma) + self.gamma
-        r = torch.clamp(s, 0, 1)
+        r = self._round_offset(hard=hard)
 
         x_int = x_floor + r
-        x_int = torch.clamp(x_int, self.qmin.item(), self.qmax.item())
+        qmin = self.qmin.to(x_int.device)
+        qmax = self.qmax.to(x_int.device)
+        x_int = torch.clamp(x_int, qmin, qmax)
+
+        if return_int:
+            return x_int, scale
 
         x_q = x_int * scale
         return x_q, scale
@@ -103,9 +114,9 @@ class AdaRoundLinear(nn.Module):
         )
 
     def forward(self, x):
-        w_q, scale = self.quantizer(self.fc.weight)
+        w_q, _ = self.quantizer(self.fc.weight)
         # Return ONLY the linear output (drop scales)
-        return F.linear(x, w_q * scale, self.fc.bias)
+        return F.linear(x, w_q, self.fc.bias)
 
     @classmethod
     def from_linear(cls, linear: nn.Linear, bit: int) -> "AdaRoundLinear":
@@ -123,7 +134,6 @@ class AdaRoundLinear(nn.Module):
 
 class LinearInt(nn.Linear):
     def __init__(self, in_features, out_features, w_scale, int_dtype, device='cpu'):
-        assert device == 'cpu', "LinearInt only supports cpu"
         super().__init__(in_features, out_features, bias=True, device=device)
         self.weight.requires_grad = False
         self.weight.data = self.weight.data.to(int_dtype)
@@ -131,16 +141,17 @@ class LinearInt(nn.Linear):
         self.bias.data = self.bias.data.to(int_dtype)
         self.int_dtype = int_dtype
 
-        self.w_scale = w_scale.to(device)
-        if self.w_scale.dim() == 2:
-            self.w_scale = self.w_scale.T
+        w_scale = w_scale.to(device)
+        if w_scale.dim() == 2:
+            w_scale = w_scale.T
+        self.register_buffer("w_scale", w_scale)
         self.quantizer_act = AdaRoundQuantizer(
             torch.iinfo(int_dtype).bits,
-            per_channel=True,
+            per_channel=False,
         ).to(device)
 
     def forward(self, input_x):
-        act_q, act_scale = self.quantizer_act(input_x)
+        act_q, act_scale = self.quantizer_act(input_x, hard=True, return_int=True)
         q_out = torch._int_mm(act_q.to(self.int_dtype), self.weight.T) + self.bias
         return q_out * (act_scale * self.w_scale)
 
@@ -148,7 +159,9 @@ class LinearInt(nn.Linear):
     def from_qat(cls, quantized_fc: AdaRoundLinear, int_dtype: torch.dtype) -> "LinearInt":
         in_features = quantized_fc.fc.in_features
         out_features = quantized_fc.fc.out_features
-        weight_q, weight_scale = quantized_fc.quantizer(quantized_fc.fc.weight.data)
+        weight_q, weight_scale = quantized_fc.quantizer(
+            quantized_fc.fc.weight.data, hard=True, return_int=True
+        )
         linear_int = cls(in_features, out_features, weight_scale, int_dtype)
         linear_int.weight.data = weight_q.to(int_dtype)
         linear_int.bias.data = quantized_fc.fc.bias.data.to(int_dtype)
