@@ -156,7 +156,6 @@ class QALinear(nn.Module):
 
 class LinearInt(nn.Linear):
     def __init__(self, in_features, out_features, w_scale, q_a, int_dtype, device='cpu'):
-        assert device == 'cpu', "LinearInt only supports cpu"
         super().__init__(in_features, out_features, bias=True, device=device)
         self.weight.requires_grad = False
         self.weight.data = self.weight.data.to(int_dtype)

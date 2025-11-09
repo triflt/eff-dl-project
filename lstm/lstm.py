@@ -1,3 +1,5 @@
+import copy
+
 import torch
 import torch.nn as nn
 
@@ -126,3 +128,45 @@ class LSTM(nn.Module):
         )
         new_model.cell = self.cell.quantize(bits, linear_int_class)
         return new_model
+
+
+class LSTMClassifier(nn.Module):
+    def __init__(self, vocab_size: int, embed_dim: int, hidden_dim: int, num_classes: int, pad_idx: int):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
+        self.lstm = LSTM(embed_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, input_ids: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        embedded = self.embedding(input_ids)
+        outputs, _ = self.lstm(embedded)
+        batch_range = torch.arange(outputs.size(0), device=outputs.device)
+        last_indices = lengths - 1
+        last_hidden = outputs[batch_range, last_indices]
+        return self.fc(last_hidden)
+
+    def to_qat(self, bits: int, qat_linear_class, **qat_kwargs) -> "LSTMClassifier":
+        new_model = LSTMClassifier(
+            vocab_size=self.embedding.num_embeddings,
+            embed_dim=self.embedding.embedding_dim,
+            hidden_dim=self.fc.in_features,
+            num_classes=self.fc.out_features,
+            pad_idx=self.embedding.padding_idx,
+        )
+        new_model.lstm = self.lstm.to_qat(bits, qat_linear_class, **qat_kwargs)
+        new_model.embedding = copy.deepcopy(self.embedding)
+        new_model.fc = copy.deepcopy(self.fc)
+        return new_model.to(self.fc.weight.device)
+
+    def quantize(self, bits: int, linear_int_class) -> "LSTMClassifier":
+        new_model = LSTMClassifier(
+            vocab_size=self.embedding.num_embeddings,
+            embed_dim=self.embedding.embedding_dim,
+            hidden_dim=self.fc.in_features,
+            num_classes=self.fc.out_features,
+            pad_idx=self.embedding.padding_idx,
+        )
+        new_model.lstm = self.lstm.quantize(bits, linear_int_class)
+        new_model.embedding = copy.deepcopy(self.embedding)
+        new_model.fc = copy.deepcopy(self.fc)
+        return new_model.to(self.fc.weight.device)
