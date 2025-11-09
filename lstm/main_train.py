@@ -12,7 +12,8 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from lstm import LSTMClassifier
 # from lsq import QuantLinear, LinearInt
 # from pact import QuantLinear, LinearInt
-from adaround import QuantLinear, LinearInt
+# from adaround import QuantLinear, LinearInt
+from apot import QuantLinear, LinearInt
 
 DATA_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/00228/smsspamcollection.zip"
 DATA_DIR = "./data"
