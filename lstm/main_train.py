@@ -13,7 +13,8 @@ from lstm import LSTMClassifier
 # from lsq import QuantLinear, LinearInt
 # from pact import QuantLinear, LinearInt
 # from adaround import QuantLinear, LinearInt
-from apot import QuantLinear, LinearInt
+# from apot import QuantLinear, LinearInt
+from efficientqat import QuantLinear, LinearInt
 
 DATA_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/00228/smsspamcollection.zip"
 DATA_DIR = "./data"
@@ -187,7 +188,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
 train_loss = train_epoch(model, dl_train, criterion, optimizer, device)
 val_loss, val_acc = evaluate(model, dl_test, criterion, device)
 print(f"Epoch {1:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%")
-print('\n\n\n')
+print('\n')
 
 
 model_qat = model.to_qat(bits=8, qat_linear_class=QuantLinear)
