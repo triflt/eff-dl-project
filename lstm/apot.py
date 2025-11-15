@@ -208,7 +208,6 @@ class Quantizer(nn.Module):
     def quantize_to_int(
         self,
         x: torch.Tensor,
-        dtype: torch.dtype = torch.int8,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Convenience helper that returns integer tensors suitable for integer GEMM.
@@ -221,7 +220,7 @@ class Quantizer(nn.Module):
         qmax = float(self.int_qmax)
         qmin = float(self.int_qmin)
         q = torch.round(norm_out * qmax).clamp_(qmin, qmax).detach()
-        return q.to(dtype), (scale / qmax).detach()
+        return q, (scale / qmax).detach()
 
 
 class QuantLinear(nn.Module):
@@ -313,7 +312,6 @@ class LinearInt(nn.Linear):
         self.int_dtype = int_dtype
         self.weight.requires_grad = False
         self.bias.requires_grad = False
-        self.weight.data = self.weight.data.to(int_dtype)
 
         w_scale = w_scale.detach().to(torch.float32)
         if w_scale.numel() == 1:
@@ -331,22 +329,18 @@ class LinearInt(nn.Linear):
         for param in self.quantizer_act.parameters():
             param.requires_grad = False
 
-    def forward(self, input_x: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_x, act_scale=None):
+        if act_scale is None:
+            act_q, act_scale = self.quantize_input(input_x)
+            act_q = act_q.to(self.int_dtype)
+        else:
+            act_q = input_x
+        
+        q_out = torch._int_mm(act_q, self.weight.T)
+        return q_out * (act_scale * self.w_scale) + self.bias
 
-        act_int, act_scale = self.quantizer_act.quantize_to_int(
-            input_x,
-            dtype=self.int_dtype,
-        )
-        act_int = act_int.to(self.int_dtype).contiguous()
-        weight_int = self.weight.to(self.int_dtype).contiguous()
-        q_out = torch._int_mm(act_int, weight_int.T).to(torch.int32)
-
-        act_scale = act_scale.to(torch.float32)
-        scale = (act_scale * self.w_scale).to(torch.float32)
-        out = q_out.to(torch.float32) * scale
-        if self.bias is not None:
-            out = out + self.bias
-        return out
+    def quantize_input(self, input_x):
+        return self.quantizer_act.quantize_to_int(input_x)
 
     @classmethod
     def from_qat(
@@ -356,7 +350,6 @@ class LinearInt(nn.Linear):
     ) -> "LinearInt":
         weight_int, weight_scale = quantized_fc.weight_quant.quantize_to_int(
             quantized_fc.fc.weight.data,
-            dtype=int_dtype,
         )
         act_quant = copy.deepcopy(quantized_fc.act_quant)
 
@@ -369,5 +362,5 @@ class LinearInt(nn.Linear):
         )
 
         linear_int.weight.data = weight_int.to(linear_int.int_dtype)
-        linear_int.bias.data = quantized_fc.fc.bias.detach().to(linear_int.bias.dtype)
+        linear_int.bias.data = copy.deepcopy(quantized_fc.fc.bias.detach())
         return linear_int

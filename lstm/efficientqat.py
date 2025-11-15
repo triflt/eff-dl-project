@@ -220,7 +220,6 @@ class ActivationQuantizer(nn.Module):
     def quantize_to_int(
         self,
         x: torch.Tensor,
-        dtype: torch.dtype = torch.int8,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.initialized:
             self._init_from(x)
@@ -228,7 +227,7 @@ class ActivationQuantizer(nn.Module):
         scale = torch.clamp(self.scale.detach(), min=CLIP_MIN).to(x.device)
         x_scaled = x / scale
         x_scaled = torch.clamp(x_scaled, self.qmin, self.qmax)
-        x_int = torch.round(x_scaled).to(dtype)
+        x_int = torch.round(x_scaled)
         return x_int, scale
 
 
@@ -333,20 +332,18 @@ class LinearInt(nn.Linear):
         for param in self.quantizer_act.parameters():
             param.requires_grad = False
 
-    def forward(self, input_x: torch.Tensor) -> torch.Tensor:
-        act_int, act_scale = self.quantizer_act.quantize_to_int(
-            input_x,
-            dtype=self.int_dtype,
-        )
-        act_int = act_int.to(self.int_dtype).contiguous()
-        weight_int = self.weight.to(self.int_dtype).contiguous()
-        q_out = torch._int_mm(act_int, weight_int.T).to(torch.int32)
+    def forward(self, input_x, act_scale=None):
+        if act_scale is None:
+            act_q, act_scale = self.quantize_input(input_x)
+            act_q = act_q.to(self.int_dtype)
+        else:
+            act_q = input_x
+        
+        q_out = torch._int_mm(act_q, self.weight.T)
+        return q_out * (act_scale * self.w_scale) + self.bias
 
-        scale_total = act_scale.to(torch.float32).view(-1, 1) * self.w_scale
-        out = q_out.to(torch.float32) * scale_total
-        if self.bias is not None:
-            out = out + self.bias
-        return out
+    def quantize_input(self, input_x):
+        return self.quantizer_act.quantize_to_int(input_x)
 
     @classmethod
     def from_qat(
@@ -356,7 +353,6 @@ class LinearInt(nn.Linear):
     ) -> "LinearInt":
         weight_int, weight_scale = quantized_fc.weight_quant.quantize_to_int(
             quantized_fc.fc.weight.data,
-            dtype=int_dtype,
         )
 
         act_quant = copy.deepcopy(quantized_fc.act_quant)
@@ -369,5 +365,5 @@ class LinearInt(nn.Linear):
             int_dtype=int_dtype,
         )
         linear_int.weight.data = weight_int.to(int_dtype)
-        linear_int.bias.data = quantized_fc.fc.bias.detach().to(linear_int.bias.dtype)
+        linear_int.bias.data = copy.deepcopy(quantized_fc.fc.bias.detach())
         return linear_int

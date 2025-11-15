@@ -1,3 +1,5 @@
+import copy
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -133,27 +135,32 @@ class QuantLinear(nn.Module):
 
 
 class LinearInt(nn.Linear):
-    def __init__(self, in_features, out_features, w_scale, int_dtype, device='cpu'):
-        super().__init__(in_features, out_features, bias=True, device=device)
+    def __init__(self, in_features, out_features, w_scale, int_dtype):
+        super().__init__(in_features, out_features, bias=True)
         self.weight.requires_grad = False
-        self.weight.data = self.weight.data.to(int_dtype)
         self.bias.requires_grad = False
-        self.bias.data = self.bias.data.to(int_dtype)
         self.int_dtype = int_dtype
 
-        w_scale = w_scale.to(device)
         if w_scale.dim() == 2:
             w_scale = w_scale.T
         self.register_buffer("w_scale", w_scale)
         self.quantizer_act = Quantizer(
             torch.iinfo(int_dtype).bits,
             per_channel=False,
-        ).to(device)
+        )
 
-    def forward(self, input_x):
-        act_q, act_scale = self.quantizer_act(input_x, hard=True, return_int=True)
-        q_out = torch._int_mm(act_q.to(self.int_dtype), self.weight.T) + self.bias
-        return q_out * (act_scale * self.w_scale)
+    def forward(self, input_x, act_scale=None):
+        if act_scale is None:
+            act_q, act_scale = self.quantize_input(input_x)
+            act_q = act_q.to(self.int_dtype)
+        else:
+            act_q = input_x
+
+        q_out = torch._int_mm(act_q, self.weight.T)
+        return q_out * (act_scale * self.w_scale) + self.bias
+
+    def quantize_input(self, input_x):
+        return self.quantizer_act(input_x, hard=True, return_int=True)
 
     @classmethod
     def from_qat(cls, quantized_fc: QuantLinear, int_dtype: torch.dtype) -> "LinearInt":
@@ -164,5 +171,5 @@ class LinearInt(nn.Linear):
         )
         linear_int = cls(in_features, out_features, weight_scale, int_dtype)
         linear_int.weight.data = weight_q.to(int_dtype)
-        linear_int.bias.data = quantized_fc.fc.bias.data.to(int_dtype)
+        linear_int.bias.data = copy.deepcopy(quantized_fc.fc.bias.data.detach())
         return linear_int
