@@ -72,19 +72,37 @@ class LSTMCell(nn.Module):
 
 
 class LSTM(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, bias: bool = True, batch_first: bool = True):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        *,
+        num_layers: int = 1,
+        bias: bool = True,
+        batch_first: bool = True,
+    ):
         super().__init__()
+        if num_layers < 1:
+            raise ValueError(f"num_layers must be >= 1 (got {num_layers})")
         self.batch_first = batch_first
         self.hidden_size = hidden_size
-        self.cell = LSTMCell(input_size, hidden_size, bias=bias)
+        self.input_size = input_size
+        self.num_layers = num_layers
+        cells = []
+        layer_input_size = input_size
+        for _ in range(num_layers):
+            cells.append(LSTMCell(layer_input_size, hidden_size, bias=bias))
+            layer_input_size = hidden_size
+        self.layers = nn.ModuleList(cells)
 
     def forward(self, x, hx=None):
         """
         x: (B, T, D) if batch_first else (T, B, D)
-        hx: optional ((B, H), (B, H)) initial (h0, c0)
+        hx: optional ((num_layers, B, H), (num_layers, B, H)) initial (h0, c0).
+            For single-layer LSTMs, ((B, H), (B, H)) is also accepted.
         returns:
           outputs: (B, T, H) if batch_first else (T, B, H)
-          (h_T, c_T): each (B, H)
+          (h_T, c_T): each (num_layers, B, H) unless num_layers == 1 (then (B, H))
         """
         if not self.batch_first:
             # convert to batch_first for simpler looping
@@ -92,49 +110,89 @@ class LSTM(nn.Module):
 
         B, T, D = x.shape
         if hx is None:
-            h_t = x.new_zeros(B, self.hidden_size)
-            c_t = x.new_zeros(B, self.hidden_size)
+            h_list = [x.new_zeros(B, self.hidden_size) for _ in range(self.num_layers)]
+            c_list = [x.new_zeros(B, self.hidden_size) for _ in range(self.num_layers)]
         else:
             h_t, c_t = hx
+            if self.num_layers == 1 and h_t.dim() == 2 and c_t.dim() == 2:
+                h_t = h_t.unsqueeze(0)
+                c_t = c_t.unsqueeze(0)
+            if h_t.dim() != 3 or c_t.dim() != 3:
+                raise ValueError(
+                    "Hidden state tensors must be 3D (num_layers, batch, hidden_size) "
+                    f"but got shapes {tuple(h_t.shape)} and {tuple(c_t.shape)}"
+                )
+            if h_t.size(0) != self.num_layers or c_t.size(0) != self.num_layers:
+                raise ValueError(
+                    f"Expected hidden states for {self.num_layers} layers "
+                    f"but got {h_t.size(0)} and {c_t.size(0)} layers"
+                )
+            h_list = [h_t[layer] for layer in range(self.num_layers)]
+            c_list = [c_t[layer] for layer in range(self.num_layers)]
 
         outputs = []
         for t in range(T):
-            h_t, c_t = self.cell(x[:, t, :], (h_t, c_t))
-            outputs.append(h_t.unsqueeze(1))  # (B, 1, H)
+            layer_input = x[:, t, :]
+            for layer_idx, cell in enumerate(self.layers):
+                h_layer, c_layer = cell(layer_input, (h_list[layer_idx], c_list[layer_idx]))
+                h_list[layer_idx] = h_layer
+                c_list[layer_idx] = c_layer
+                layer_input = h_layer
+            outputs.append(layer_input.unsqueeze(1))  # (B, 1, H)
 
         outputs = torch.cat(outputs, dim=1)    # (B, T, H)
 
         if not self.batch_first:
             outputs = outputs.transpose(0, 1)  # back to (T, B, H)
 
-        return outputs, (h_t, c_t)
+        h_out = torch.stack(h_list, dim=0)
+        c_out = torch.stack(c_list, dim=0)
+        if self.num_layers == 1:
+            h_out = h_out.squeeze(0)
+            c_out = c_out.squeeze(0)
+        return outputs, (h_out, c_out)
 
     def to_qat(self, bits: int, qat_linear_class, **qat_kwargs) -> "LSTM":
         new_model = LSTM(
-            input_size=self.cell.input_size,
-            hidden_size=self.cell.hidden_size,
-            bias=self.cell.linear.bias is not None,
+            input_size=self.input_size,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            bias=self.layers[0].linear.bias is not None,
             batch_first=self.batch_first,
         )
-        new_model.cell = self.cell.to_qat(bits, qat_linear_class, **qat_kwargs)
+        new_model.layers = nn.ModuleList(
+            [layer.to_qat(bits, qat_linear_class, **qat_kwargs) for layer in self.layers]
+        )
         return new_model
 
     def quantize(self, bits: int, linear_int_class) -> "LSTM":
         new_model = LSTM(
-            input_size=self.cell.input_size,
-            hidden_size=self.cell.hidden_size,
-            bias=self.cell.linear.fc.bias is not None,
+            input_size=self.input_size,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            bias=self.layers[0].linear.fc.bias is not None,
             batch_first=self.batch_first,
         )
-        new_model.cell = self.cell.quantize(bits, linear_int_class)
+        new_model.layers = nn.ModuleList(
+            [layer.quantize(bits, linear_int_class) for layer in self.layers]
+        )
         return new_model
 
 
 class LSTMClassifier(nn.Module):
-    def __init__(self, vocab_size: int, embed_dim: int, hidden_dim: int, num_classes: int, pad_idx: int):
+    def __init__(
+        self,
+        vocab_size: int,
+        embed_dim: int,
+        hidden_dim: int,
+        num_classes: int,
+        pad_idx: int,
+        *,
+        num_layers: int = 1,
+    ):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
-        self.lstm = LSTM(embed_dim, hidden_dim, batch_first=True)
+        self.lstm = LSTM(embed_dim, hidden_dim, num_layers=num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, input_ids: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
@@ -152,6 +210,7 @@ class LSTMClassifier(nn.Module):
             hidden_dim=self.fc.in_features,
             num_classes=self.fc.out_features,
             pad_idx=self.embedding.padding_idx,
+            num_layers=self.lstm.num_layers,
         )
         new_model.lstm = self.lstm.to_qat(bits, qat_linear_class, **qat_kwargs)
         new_model.embedding = copy.deepcopy(self.embedding)
@@ -165,6 +224,7 @@ class LSTMClassifier(nn.Module):
             hidden_dim=self.fc.in_features,
             num_classes=self.fc.out_features,
             pad_idx=self.embedding.padding_idx,
+            num_layers=self.lstm.num_layers,
         )
         new_model.lstm = self.lstm.quantize(bits, linear_int_class)
         new_model.embedding = copy.deepcopy(self.embedding)

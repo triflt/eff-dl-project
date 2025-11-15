@@ -12,7 +12,6 @@ from datasets import load_dataset
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 from sklearn.model_selection import train_test_split
-from torch.optim.lr_scheduler import _LRScheduler
 
 from lstm import LSTMClassifier
 from lsq import QuantLinear, LinearInt
@@ -23,7 +22,7 @@ from lsq import QuantLinear, LinearInt
 
 MAX_VOCAB_SIZE = 20000
 MIN_FREQ = 2
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 BASE_EPOCHS = 1
 QAT_EPOCHS = 1
 N_SAMPLES = 10_000
@@ -131,7 +130,7 @@ def train_epoch(
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    scheduler: Optional[_LRScheduler] = None,
+    scheduler = None,
 ) -> tuple[float, list[float]]:
     model.train()
     epoch_loss = 0.0
@@ -202,14 +201,15 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model = LSTMClassifier(
     vocab_size=vocab_size,
-    embed_dim=256,
-    hidden_dim=256,
+    embed_dim=128,
+    hidden_dim=128,
     num_classes=2,
+    num_layers=2,
     pad_idx=pad_idx,
 ).to(device)
 
 criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 base_total_steps = max(1, BASE_EPOCHS * len(dl_train))
 base_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=base_total_steps)
 base_iter_losses: list[float] = []
@@ -255,8 +255,10 @@ print(f"Saved base model checkpoint to {BASE_MODEL_PATH}")
 model.train()
 
 model_qat = model.to_qat(bits=8, qat_linear_class=QuantLinear)
-optimizer_qa = torch.optim.AdamW(model_qat.parameters(), lr=1e-4)
-qat_total_steps = max(1, QAT_EPOCHS * len(dl_train))
+del model
+torch.cuda.empty_cache()
+optimizer_qa = torch.optim.AdamW(model_qat.parameters(), lr=1e-2)
+qat_total_steps = max(1, QAT_EPOCHS * len(dl_train)) * 2
 qat_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_qa, T_max=qat_total_steps)
 final_quantized_model = None
 
