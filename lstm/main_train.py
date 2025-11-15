@@ -24,7 +24,7 @@ MIN_FREQ = 2
 BATCH_SIZE = 32
 BASE_EPOCHS = 1
 QAT_EPOCHS = 1
-N_SAMPLES = 1_000
+N_SAMPLES = 10_000
 
 TOKEN_RE = re.compile(r"\b\w+\b", flags=re.UNICODE)
 
@@ -197,14 +197,14 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model = LSTMClassifier(
     vocab_size=vocab_size,
-    embed_dim=48,
-    hidden_dim=48,
+    embed_dim=256,
+    hidden_dim=256,
     num_classes=2,
     pad_idx=pad_idx,
 ).to(device)
 
 criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 base_train_losses: list[float] = []
 base_iter_losses: list[float] = []
 base_val_losses: list[float] = []
@@ -251,7 +251,7 @@ print(f"Saved base model checkpoint to {BASE_MODEL_PATH}")
 model.train()
 
 model_qat = model.to_qat(bits=8, qat_linear_class=QuantLinear)
-optimizer_qa = torch.optim.Adam(model_qat.parameters(), lr=3e-4)
+optimizer_qa = torch.optim.AdamW(model_qat.parameters(), lr=1e-4)
 final_quantized_model = None
 
 for epoch in range(1, QAT_EPOCHS + 1):
