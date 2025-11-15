@@ -76,7 +76,7 @@ def plot_loss_curves(method: str, run_dirs: Sequence[Path], output_path: Path) -
         return
 
     plt.title(f"{method.upper()} QAT Loss Curves")
-    plt.xlabel("Epoch")
+    plt.xlabel("Iteration")
     plt.ylabel("Loss")
     plt.grid(True, alpha=0.3)
     plt.legend()
@@ -137,7 +137,7 @@ def plot_metric_curves(
             ax.scatter(xs, ys, label=label)
         ax.scatter([0], [base_metrics], label="base", marker="x", color="black")
         ax.set_title(f"{method.upper()} {metric_name}")
-        ax.set_xlabel("Measurement")
+        ax.set_xlabel("Epoch")
         ax.set_ylabel(metric_name)
         ax.grid(True, alpha=0.3)
         ax.legend()
