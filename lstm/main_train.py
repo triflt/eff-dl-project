@@ -5,7 +5,9 @@ import json
 import re
 import time
 from collections import Counter
+from itertools import product
 from pathlib import Path
+from typing import Any, Optional
 
 import requests
 import torch
@@ -15,18 +17,25 @@ import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 
 from lstm import LSTMClassifier
-# from lsq import QuantLinear, LinearInt
-# from pact import QuantLinear, LinearInt
-# from adaround import QuantLinear, LinearInt
-# from apot import QuantLinear, LinearInt
-from efficientqat import QuantLinear, LinearInt
+from lsq import QuantLinear as QLLSQ, LinearInt as LILSQ
+from pact import QuantLinear as QLPACT, LinearInt as LIPACT
+from adaround import QuantLinear as QLA, LinearInt as LIA
+from apot import QuantLinear as QLAP, LinearInt as LIAP
+from efficientqat import QuantLinear as QLEF, LinearInt as LIEF
+
+qat_dict = {
+    "lsq": {"ql": QLLSQ, "li": LILSQ},
+    "pact": {"ql": QLPACT, "li": LIPACT},
+    "adaround": {"ql": QLA, "li": LIA},
+    "apot": {"ql": QLAP, "li": LIAP},
+    "efficientqat": {"ql": QLEF, "li": LIEF},
+}
 
 torch.manual_seed(0)
 MAX_VOCAB_SIZE = 20000
 MIN_FREQ = 2
 BATCH_SIZE = 64
-BASE_EPOCHS = 1
-QAT_EPOCHS = 2
+TRAIN_RATIO = 0.7
 
 TOKEN_RE = re.compile(r"\b\w+\b", flags=re.UNICODE)
 
@@ -38,15 +47,6 @@ def tokenize(s: str) -> list[str]:
 DATA_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/00228/smsspamcollection.zip"
 DATA_DIR = "./data"
 PAD, UNK = "<pad>", "<unk>"
-ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts" / "eq"
-ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-BASE_MODEL_PATH = ARTIFACT_DIR / "lstm_base.pt"
-QUANT_MODEL_PATH = ARTIFACT_DIR / "lstm_quantized.pt"
-TOKENIZER_PATH = ARTIFACT_DIR / "tokenizer.json"
-BASE_LOSS_PLOT_PATH = ARTIFACT_DIR / "base_loss.png"
-QAT_LOSS_PLOT_PATH = ARTIFACT_DIR / "qat_loss.png"
-TIMINGS_PATH = ARTIFACT_DIR / "timings.json"
-METRICS_PATH = ARTIFACT_DIR / "metrics.json"
 
 
 def download_sms_dataset() -> list[tuple[int, str]]:
@@ -72,6 +72,7 @@ def download_sms_dataset() -> list[tuple[int, str]]:
             y = 1 if label == "spam" else 0
             data.append((y, text))
     return data
+
 
 def build_vocab(texts: list[list[str]]):
     counter = Counter()
@@ -190,135 +191,292 @@ def evaluate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module, dev
     dataset_size = len(dataloader.dataset)
     return epoch_loss / dataset_size, epoch_acc / dataset_size
 
-data = download_sms_dataset()
-# Tokenize once to build vocab on train only
-train_p = 0.7
-train_set, test_set = random_split(data, lengths=(train_p, 1 - train_p))
 
-all_tokens = [tokenize(txt) for _, txt in train_set]
-stoi, itos = build_vocab(all_tokens)
-pad_idx = stoi[PAD]
-vocab_size = len(itos)
-print(f"Vocab size: {vocab_size}")
-tokenizer_payload = {
-    "stoi": stoi,
-    "itos": itos,
-    "pad_idx": pad_idx,
-    "pad_token": PAD,
-    "unk_token": UNK,
-}
-with TOKENIZER_PATH.open("w", encoding="utf-8") as f:
-    json.dump(tokenizer_payload, f, ensure_ascii=True, indent=2)
-print(f"Saved tokenizer to {TOKENIZER_PATH}")
+def prepare_dataset(train_ratio: float = TRAIN_RATIO) -> tuple[list[tuple[int, str]], list[tuple[int, str]], dict[str, Any]]:
+    """Download the dataset (if needed) and build cached train/test splits plus tokenizer."""
+    data = download_sms_dataset()
+    if len(data) < 2:
+        raise RuntimeError("Dataset must contain at least 2 samples to create train/test splits.")
 
-# Datasets
-ds_train = TextDataset(train_set, stoi)
-ds_test  = TextDataset(test_set, stoi)
+    train_len = max(1, int(len(data) * train_ratio))
+    test_len = len(data) - train_len
+    if test_len == 0:
+        test_len = 1
+        train_len = len(data) - test_len
 
-# Loaders
-collate = lambda b: collate_batch(b, pad_idx)
-dl_train = DataLoader(ds_train, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate)
-dl_test  = DataLoader(ds_test, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate)
+    generator = torch.Generator().manual_seed(0)
+    train_subset, test_subset = random_split(data, [train_len, test_len], generator=generator)
+    train_samples = list(train_subset)
+    test_samples = list(test_subset)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    all_tokens = [tokenize(txt) for _, txt in train_samples]
+    stoi, itos = build_vocab(all_tokens)
+    pad_idx = stoi[PAD]
+    print(f"Vocab size: {len(itos)}")
+    tokenizer_payload = {
+        "stoi": stoi,
+        "itos": itos,
+        "pad_idx": pad_idx,
+        "pad_token": PAD,
+        "unk_token": UNK,
+    }
+    return train_samples, test_samples, tokenizer_payload
 
-model = LSTMClassifier(
-    vocab_size=vocab_size,
-    embed_dim=96,
-    hidden_dim=96,
-    num_classes=2,
-    num_layers=2,
-    pad_idx=pad_idx,
-).to(device)
 
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-base_total_steps = max(1, BASE_EPOCHS * len(dl_train))
-base_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=base_total_steps)
-base_iter_losses: list[float] = []
-qat_iter_losses: list[float] = []
-timings = {
-    "train": 0.0,
-    "infer": 0.0,
-    "qat_train": 0.0,
-    "qat_infer": 0.0,
-    "quantized_infer": 0.0,
-}
-metrics = {
-    "train_acc": [],
-    "qat_acc": [],
-    "quantized_acc": [],
-}
+def build_dataloaders(
+    train_samples: list[tuple[int, str]],
+    test_samples: list[tuple[int, str]],
+    tokenizer: dict[str, Any],
+    batch_size: int,
+) -> tuple[DataLoader, DataLoader]:
+    """Create train/test dataloaders for the cached samples."""
+    stoi = tokenizer["stoi"]
+    pad_idx = tokenizer["pad_idx"]
+    collate_fn = lambda batch: collate_batch(batch, pad_idx)
+    ds_train = TextDataset(train_samples, stoi)
+    ds_test = TextDataset(test_samples, stoi)
+    dl_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    dl_test = DataLoader(ds_test, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    return dl_train, dl_test
 
-for epoch in range(1, BASE_EPOCHS + 1):
-    start_time = time.perf_counter()
-    train_loss, batch_losses = train_epoch(model, dl_train, criterion, optimizer, device, scheduler=base_scheduler)
-    timings["train"] += time.perf_counter() - start_time
-    base_iter_losses.extend(batch_losses)
+def train_base_model(
+    train_samples,
+    test_samples,
+    tokenizer,
+    batch_size: int,
+    lr: float,
+    lstm_dim: int,
+    num_layers: int,
+    epochs: int,
+) -> tuple[nn.Module, dict[str, Any], dict[str, float], dict[str, list[float]], dict[str, list[float]]]:
+    """Train the floating-point LSTM model and return the model plus training artifacts."""
+    dl_train, dl_test = build_dataloaders(train_samples, test_samples, tokenizer, batch_size)
 
-    start_time = time.perf_counter()
-    val_loss, val_acc = evaluate(model, dl_test, criterion, device)
-    timings["infer"] += time.perf_counter() - start_time
-    metrics["train_acc"].append(val_acc)
+    vocab_size = len(tokenizer["itos"])
+    pad_idx = tokenizer["pad_idx"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"Epoch {epoch:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%")
-    print("\n")
+    model = LSTMClassifier(
+        vocab_size=vocab_size,
+        embed_dim=lstm_dim,
+        hidden_dim=lstm_dim,
+        num_classes=2,
+        num_layers=num_layers,
+        pad_idx=pad_idx,
+    ).to(device)
 
-base_train_steps = list(range(1, len(base_iter_losses) + 1))
-save_loss_plot(base_iter_losses, base_train_steps, BASE_LOSS_PLOT_PATH, "Base Model Loss")
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    total_steps = max(1, epochs * len(dl_train))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
 
-model.eval()
-torch.save(model.cpu(), BASE_MODEL_PATH)
-model.to(device)
-print(f"Saved base model checkpoint to {BASE_MODEL_PATH}")
-model.train()
+    timings = {"train": 0.0, "infer": 0.0}
+    metrics = {"train_acc": []}
+    losses = {"train": []}
 
-model_qat = model.to_qat(bits=8, qat_linear_class=QuantLinear)
-del model
-torch.cuda.empty_cache()
-optimizer_qa = torch.optim.AdamW(model_qat.parameters(), lr=5e-3)
-qat_total_steps = max(1, QAT_EPOCHS * len(dl_train))
-qat_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_qa, T_max=qat_total_steps)
-final_quantized_model = None
+    for epoch in range(1, epochs + 1):
+        start_time = time.perf_counter()
+        train_loss, batch_losses = train_epoch(model, dl_train, criterion, optimizer, device, scheduler=scheduler)
+        timings["train"] += time.perf_counter() - start_time
+        losses["train"].extend(batch_losses)
 
-for epoch in range(1, QAT_EPOCHS + 1):
-    start_time = time.perf_counter()
-    train_loss, batch_losses = train_epoch(
-        model_qat, dl_train, criterion, optimizer_qa, device, scheduler=qat_scheduler
+        start_time = time.perf_counter()
+        val_loss, val_acc = evaluate(model, dl_test, criterion, device)
+        timings["infer"] += time.perf_counter() - start_time
+        metrics["train_acc"].append(val_acc)
+
+        print(
+            f"Epoch {epoch:02d} | train_loss={train_loss:.4f} | "
+            f"val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%"
+        )
+
+    return model, tokenizer, timings, metrics, losses
+
+
+def train_qat_models(
+    train_samples,
+    test_samples,
+    tokenizer,
+    base_model: nn.Module,
+    batch_size: int,
+    lr: float,
+    epochs: int,
+    qat_method: str,
+) -> tuple[nn.Module, Optional[nn.Module], dict[str, float], dict[str, list[float]], dict[str, list[float]]]:
+    """Fine-tune the base model with QAT and additionally produce a quantized model."""
+    dl_train, dl_test = build_dataloaders(train_samples, test_samples, tokenizer, batch_size)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    criterion = nn.CrossEntropyLoss()
+    model_qat = base_model.to(device).to_qat(bits=8, qat_linear_class=qat_dict[qat_method]['ql'])
+    optimizer = torch.optim.AdamW(model_qat.parameters(), lr=lr)
+    total_steps = max(1, epochs * len(dl_train))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+
+    timings = {"qat_train": 0.0, "qat_infer": 0.0, "quantized_infer": 0.0}
+    metrics = {"qat_acc": [], "quantized_acc": []}
+    losses = {"qat_train": [], "quantized_eval": []}
+    final_quantized_model: Optional[nn.Module] = None
+
+    for epoch in range(1, epochs + 1):
+        start_time = time.perf_counter()
+        train_loss, batch_losses = train_epoch(
+            model_qat, dl_train, criterion, optimizer, device, scheduler=scheduler
+        )
+        timings["qat_train"] += time.perf_counter() - start_time
+        losses["qat_train"].extend(batch_losses)
+
+        start_time = time.perf_counter()
+        val_loss, val_acc = evaluate(model_qat, dl_test, criterion, device)
+        timings["qat_infer"] += time.perf_counter() - start_time
+        metrics["qat_acc"].append(val_acc)
+        print(
+            f"QAT Epoch {epoch:02d} | train_loss={train_loss:.4f} | "
+            f"val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%"
+        )
+
+        quantized_model = model_qat.quantize(bits=8, linear_int_class=qat_dict[qat_method]['li'])
+        quantized_model.to(device)
+        start_time = time.perf_counter()
+        q_val_loss, q_val_acc = evaluate(quantized_model, dl_test, criterion, device)
+        timings["quantized_infer"] += time.perf_counter() - start_time
+        metrics["quantized_acc"].append(q_val_acc)
+        losses["quantized_eval"].append(q_val_loss)
+        print(f"Quantized Epoch {epoch:02d} | val_loss={q_val_loss:.4f} | val_acc={q_val_acc*100:.1f}%")
+        final_quantized_model = quantized_model
+
+    return final_quantized_model, timings, metrics, losses
+
+
+def _save_model_checkpoint(model: nn.Module, path: Path) -> None:
+    """Persist a model on CPU while keeping it on the original device afterwards."""
+    original_device: Optional[torch.device] = None
+    first_param = next(model.parameters(), None)
+    if first_param is not None:
+        original_device = first_param.device
+
+    model_cpu = model.to("cpu")
+    torch.save(model_cpu, path)
+    print(f"Saved model checkpoint to {path}")
+    if original_device is not None:
+        model.to(original_device)
+
+
+def save_artifacts(
+    name: str,
+    model: Optional[nn.Module],
+    tokenizer: Optional[dict[str, Any]],
+    quantized_model: Optional[nn.Module],
+    timings: dict[str, float],
+    metrics: dict[str, list[float]],
+    base_losses: dict[str, list[float]],
+    qat_losses: dict[str, list[float]],
+) -> None:
+    ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts" / name
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    BASE_MODEL_PATH = ARTIFACT_DIR / "lstm_base.pt"
+    QUANT_MODEL_PATH = ARTIFACT_DIR / "lstm_quantized.pt"
+    TOKENIZER_PATH = ARTIFACT_DIR / "tokenizer.json"
+    BASE_LOSS_PLOT_PATH = ARTIFACT_DIR / "base_loss.png"
+    QAT_LOSS_PLOT_PATH = ARTIFACT_DIR / "qat_loss.png"
+    TIMINGS_PATH = ARTIFACT_DIR / "timings.json"
+    METRICS_PATH = ARTIFACT_DIR / "metrics.json"
+
+    if tokenizer is not None:
+        with TOKENIZER_PATH.open("w", encoding="utf-8") as f:
+            json.dump(tokenizer, f, ensure_ascii=True, indent=2)
+        print(f"Saved tokenizer to {TOKENIZER_PATH}")
+
+    if model is not None:
+        _save_model_checkpoint(model.eval(), BASE_MODEL_PATH)
+
+    if quantized_model is not None:
+        quantized_model.eval()
+        quantized_model_cpu = quantized_model.to("cpu")
+        torch.save(quantized_model_cpu, QUANT_MODEL_PATH)
+        print(f"Saved quantized model checkpoint to {QUANT_MODEL_PATH}")
+
+    if base_losses.get("train"):
+        base_steps = list(range(1, len(base_losses["train"]) + 1))
+        save_loss_plot(base_losses["train"], base_steps, BASE_LOSS_PLOT_PATH, "Base Model Loss")
+
+    if qat_losses.get("qat_train"):
+        qat_steps = list(range(1, len(qat_losses["qat_train"]) + 1))
+        save_loss_plot(qat_losses["qat_train"], qat_steps, QAT_LOSS_PLOT_PATH, "QAT Model Loss")
+
+    with TIMINGS_PATH.open("w", encoding="utf-8") as f:
+        json.dump(timings, f, ensure_ascii=True, indent=2)
+    print(f"Saved timing information to {TIMINGS_PATH}")
+
+    with METRICS_PATH.open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=True, indent=2)
+    print(f"Saved metrics information to {METRICS_PATH}")
+
+
+def main() -> None:
+    """Train the base and QAT models end-to-end and save the resulting artifacts."""
+    train_samples, test_samples, tokenizer = prepare_dataset()
+    base_model, tokenizer, base_timings, base_metrics, base_losses = train_base_model(
+        train_samples,
+        test_samples,
+        tokenizer,
+        batch_size=BATCH_SIZE,
+        lr=3e-4,
+        lstm_dim=96,
+        num_layers=2,
+        epochs=1,
     )
-    timings["qat_train"] += time.perf_counter() - start_time
-    qat_iter_losses.extend(batch_losses)
 
-    start_time = time.perf_counter()
-    val_loss, val_acc = evaluate(model_qat, dl_test, criterion, device)
-    timings["qat_infer"] += time.perf_counter() - start_time
-    metrics["qat_acc"].append(val_acc)
-    print(f"QAT Epoch {epoch:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%")
+    for name, epochs, qat_method, lr in [
+        ("lsq_1_5e-3", 1, "lsq", 5e-3),
+        ("lsq_2_5e-3", 2, "lsq", 5e-3),
+        ("lsq_1_1e-3", 1, "lsq", 1e-3),
+        ("lsq_2_1e-3", 2, "lsq", 1e-3),
 
-    model_qantized = model_qat.quantize(bits=8, linear_int_class=LinearInt)
-    quant_eval_device = device
-    model_qantized.to(quant_eval_device)
-    start_time = time.perf_counter()
-    val_loss, val_acc = evaluate(model_qantized, dl_test, criterion, quant_eval_device)
-    timings["quantized_infer"] += time.perf_counter() - start_time
-    metrics["quantized_acc"].append(val_acc)
-    print(f"Quantized Epoch {epoch:02d} | val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%")
-    final_quantized_model = model_qantized
+        ("pact_1_5e-3", 1, "pact", 5e-3),
+        ("pact_2_5e-3", 2, "pact", 5e-3),
+        ("pact_1_1e-3", 1, "pact", 1e-3),
+        ("pact_2_1e-3", 2, "pact", 1e-3),
 
-if qat_iter_losses:
-    qat_train_steps = list(range(1, len(qat_iter_losses) + 1))
-    save_loss_plot(qat_iter_losses, qat_train_steps, QAT_LOSS_PLOT_PATH, "QAT Model Loss")
+        ("adaround_1_5e-3", 1, "adaround", 5e-3),
+        ("adaround_2_5e-3", 2, "adaround", 5e-3),
+        ("adaround_1_1e-3", 1, "adaround", 1e-3),
+        ("adaround_2_1e-3", 2, "adaround", 1e-3),
 
-if final_quantized_model is not None:
-    final_quantized_model.eval()
-    final_quantized_model.to('cpu')
-    torch.save(final_quantized_model, QUANT_MODEL_PATH)
-    print(f"Saved quantized model checkpoint to {QUANT_MODEL_PATH}")
+        ("apot_1_5e-3", 1, "apot", 5e-3),
+        ("apot_2_5e-3", 2, "apot", 5e-3),
+        ("apot_1_1e-3", 1, "apot", 1e-3),
+        ("apot_2_1e-3", 2, "apot", 1e-3),
 
-with TIMINGS_PATH.open("w", encoding="utf-8") as f:
-    json.dump(timings, f, ensure_ascii=True, indent=2)
-print(f"Saved timing information to {TIMINGS_PATH}")
+        ("efficientqat_1_5e-3", 1, "efficientqat", 5e-3),
+        ("efficientqat_2_5e-3", 2, "efficientqat", 5e-3),
+        ("efficientqat_1_1e-3", 1, "efficientqat", 1e-3),
+        ("efficientqat_2_1e-3", 2, "efficientqat", 1e-3),
+    ]:
+        quantized_model, qat_timings, qat_metrics, qat_losses = train_qat_models(
+            train_samples,
+            test_samples,
+            tokenizer,
+            base_model=base_model,
+            batch_size=BATCH_SIZE,
+            lr=lr,
+            epochs=epochs,
+            qat_method=qat_method,
+        )
 
-with METRICS_PATH.open("w", encoding="utf-8") as f:
-    json.dump(metrics, f, ensure_ascii=True, indent=2)
-print(f"Saved metrics information to {METRICS_PATH}")
+        timings = {**base_timings, **qat_timings}
+        metrics = {**base_metrics, **qat_metrics}
+        save_artifacts(
+            name=name,
+            model=base_model,
+            tokenizer=tokenizer,
+            quantized_model=quantized_model,
+            timings=timings,
+            metrics=metrics,
+            base_losses=base_losses,
+            qat_losses=qat_losses,
+        )
+
+
+if __name__ == "__main__":
+    main()
