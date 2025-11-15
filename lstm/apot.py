@@ -308,17 +308,14 @@ class LinearInt(nn.Linear):
         w_scale: torch.Tensor,
         act_quant: Quantizer,
         int_dtype: torch.dtype = torch.int8,
-        device: str = "cpu",
     ) -> None:
-        if device != "cpu":
-            raise ValueError("APoT LinearInt currently supports CPU execution only.")
-        super().__init__(in_features, out_features, bias=True, device=device)
+        super().__init__(in_features, out_features, bias=True)
         self.int_dtype = int_dtype
         self.weight.requires_grad = False
         self.bias.requires_grad = False
         self.weight.data = self.weight.data.to(int_dtype)
 
-        w_scale = w_scale.detach().to(device).to(torch.float32)
+        w_scale = w_scale.detach().to(torch.float32)
         if w_scale.numel() == 1:
             w_scale = w_scale.view(1, 1).repeat(1, out_features)
         else:
@@ -330,14 +327,11 @@ class LinearInt(nn.Linear):
         self.quantizer_act = act_quant
         if self.quantizer_act is None:
             raise RuntimeError("APoT LinearInt requires an activation quantizer.")
-        self.quantizer_act.to(device)
         self.quantizer_act.eval()
         for param in self.quantizer_act.parameters():
             param.requires_grad = False
 
     def forward(self, input_x: torch.Tensor) -> torch.Tensor:
-        if input_x.device.type != "cpu":
-            input_x = input_x.to("cpu")
 
         act_int, act_scale = self.quantizer_act.quantize_to_int(
             input_x,
@@ -360,17 +354,10 @@ class LinearInt(nn.Linear):
         quantized_fc: QuantLinear,
         int_dtype: torch.dtype,
     ) -> "LinearInt":
-        if not hasattr(quantized_fc, "weight_quant"):
-            raise TypeError("Expected QuantLinear instance.")
-
         weight_int, weight_scale = quantized_fc.weight_quant.quantize_to_int(
             quantized_fc.fc.weight.data,
             dtype=int_dtype,
         )
-
-        if not getattr(quantized_fc, "use_act_quant", False) or quantized_fc.act_quant is None:
-            raise RuntimeError("QuantLinear must enable activation quantization for INT export.")
-
         act_quant = copy.deepcopy(quantized_fc.act_quant)
 
         linear_int = cls(
@@ -379,7 +366,6 @@ class LinearInt(nn.Linear):
             w_scale=weight_scale,
             act_quant=act_quant,
             int_dtype=int_dtype,
-            device="cpu",
         )
 
         linear_int.weight.data = weight_int.to(linear_int.int_dtype)

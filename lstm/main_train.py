@@ -16,10 +16,10 @@ from tqdm.auto import tqdm
 
 from lstm import LSTMClassifier
 # from lsq import QuantLinear, LinearInt
-from pact import QuantLinear, LinearInt
+# from pact import QuantLinear, LinearInt
 # from adaround import QuantLinear, LinearInt
 # from apot import QuantLinear, LinearInt
-# from efficientqat import QuantLinear, LinearInt
+from efficientqat import QuantLinear, LinearInt
 
 torch.manual_seed(0)
 MAX_VOCAB_SIZE = 20000
@@ -38,7 +38,7 @@ def tokenize(s: str) -> list[str]:
 DATA_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/00228/smsspamcollection.zip"
 DATA_DIR = "./data"
 PAD, UNK = "<pad>", "<unk>"
-ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts" / "pact"
+ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts" / "eq"
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 BASE_MODEL_PATH = ARTIFACT_DIR / "lstm_base.pt"
 QUANT_MODEL_PATH = ARTIFACT_DIR / "lstm_quantized.pt"
@@ -224,8 +224,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model = LSTMClassifier(
     vocab_size=vocab_size,
-    embed_dim=128,
-    hidden_dim=128,
+    embed_dim=96,
+    hidden_dim=96,
     num_classes=2,
     num_layers=2,
     pad_idx=pad_idx,
