@@ -5,7 +5,6 @@ import json
 import re
 import time
 from collections import Counter
-from itertools import product
 from pathlib import Path
 from typing import Any, Optional
 
@@ -13,7 +12,6 @@ import requests
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, random_split
-import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 
 from lstm import LSTMClassifier
@@ -127,22 +125,16 @@ def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
     return correct / targets.size(0)
 
 
-def save_loss_plot(
+def save_loss_series(
     train_losses: list[float],
     train_steps: list[int],
     path: Path,
     title: str,
 ) -> None:
-    plt.figure()
-    plt.plot(train_steps, train_losses, label="Train")
-    plt.xlabel("Iteration")
-    plt.ylabel("Loss")
-    plt.title(title)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(path)
-    plt.close()
-    print(f"Saved {title} plot to {path}")
+    payload = {"title": title, "x": train_steps, "y": train_losses}
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=True, indent=2)
+    print(f"Saved {title} data to {path}")
 
 
 def train_epoch(
@@ -392,7 +384,7 @@ def save_base_artifacts(
     artifact_dir = _prepare_artifact_dir(name)
     base_model_path = artifact_dir / "lstm_base.pt"
     tokenizer_path = artifact_dir / "tokenizer.json"
-    base_loss_plot_path = artifact_dir / "base_loss.png"
+    base_loss_data_path = artifact_dir / "base_loss.json"
     timings_path = artifact_dir / "timings.json"
     metrics_path = artifact_dir / "metrics.json"
 
@@ -406,7 +398,7 @@ def save_base_artifacts(
 
     if losses.get("train"):
         base_steps = list(range(1, len(losses["train"]) + 1))
-        save_loss_plot(losses["train"], base_steps, base_loss_plot_path, "Base Model Loss")
+        save_loss_series(losses["train"], base_steps, base_loss_data_path, "Base Model Loss")
 
     _merge_and_save_json(timings_path, timings)
     print(f"Saved base timing information to {timings_path}")
@@ -424,7 +416,7 @@ def save_qat_artifacts(
 ) -> None:
     artifact_dir = _prepare_artifact_dir(name)
     quant_model_path = artifact_dir / "lstm_quantized.pt"
-    qat_loss_plot_path = artifact_dir / "qat_loss.png"
+    qat_loss_data_path = artifact_dir / "qat_loss.json"
     timings_path = artifact_dir / "timings.json"
     metrics_path = artifact_dir / "metrics.json"
 
@@ -436,7 +428,7 @@ def save_qat_artifacts(
 
     if losses.get("qat_train"):
         qat_steps = list(range(1, len(losses["qat_train"]) + 1))
-        save_loss_plot(losses["qat_train"], qat_steps, qat_loss_plot_path, "QAT Model Loss")
+        save_loss_series(losses["qat_train"], qat_steps, qat_loss_data_path, "QAT Model Loss")
 
     _merge_and_save_json(timings_path, timings)
     print(f"Saved QAT timing information to {timings_path}")
@@ -469,48 +461,48 @@ def main() -> None:
     )
 
     for name, epochs, qat_method, lr in [
-        # ("lsq_1_5e-3", 1, "lsq", 5e-3),
-        # ("lsq_2_5e-3", 2, "lsq", 5e-3),
-        # ("lsq_1_1e-3", 1, "lsq", 1e-3),
-        # ("lsq_2_1e-3", 2, "lsq", 1e-3),
-        # ("lsq_1_1e-2", 1, "lsq", 1e-2),
-        # ("lsq_2_1e-2", 2, "lsq", 1e-2),
+        ("lsq_1_5e-3", 1, "lsq", 5e-3),
+        ("lsq_2_5e-3", 2, "lsq", 5e-3),
+        ("lsq_1_1e-3", 1, "lsq", 1e-3),
+        ("lsq_2_1e-3", 2, "lsq", 1e-3),
+        ("lsq_1_1e-2", 1, "lsq", 1e-2),
+        ("lsq_2_1e-2", 2, "lsq", 1e-2),
         ("lsq_1_5e-2", 1, "lsq", 5e-2),
         ("lsq_2_5e-2", 2, "lsq", 5e-2),
 
-        # ("pact_1_5e-3", 1, "pact", 5e-3),
-        # ("pact_2_5e-3", 2, "pact", 5e-3),
-        # ("pact_1_1e-3", 1, "pact", 1e-3),
-        # ("pact_2_1e-3", 2, "pact", 1e-3),
-        # ("pact_1_1e-2", 1, "pact", 1e-2),
-        # ("pact_2_1e-2", 2, "pact", 1e-2),
+        ("pact_1_5e-3", 1, "pact", 5e-3),
+        ("pact_2_5e-3", 2, "pact", 5e-3),
+        ("pact_1_1e-3", 1, "pact", 1e-3),
+        ("pact_2_1e-3", 2, "pact", 1e-3),
+        ("pact_1_1e-2", 1, "pact", 1e-2),
+        ("pact_2_1e-2", 2, "pact", 1e-2),
         ("pact_1_5e-2", 1, "pact", 5e-2),
         ("pact_2_5e-2", 2, "pact", 5e-2),
 
-        # ("adaround_1_5e-3", 1, "adaround", 5e-3),
-        # ("adaround_2_5e-3", 2, "adaround", 5e-3),
-        # ("adaround_1_1e-3", 1, "adaround", 1e-3),
-        # ("adaround_2_1e-3", 2, "adaround", 1e-3),
-        # ("adaround_1_1e-2", 1, "adaround", 1e-2),
-        # ("adaround_2_1e-2", 2, "adaround", 1e-2),
+        ("adaround_1_5e-3", 1, "adaround", 5e-3),
+        ("adaround_2_5e-3", 2, "adaround", 5e-3),
+        ("adaround_1_1e-3", 1, "adaround", 1e-3),
+        ("adaround_2_1e-3", 2, "adaround", 1e-3),
+        ("adaround_1_1e-2", 1, "adaround", 1e-2),
+        ("adaround_2_1e-2", 2, "adaround", 1e-2),
         ("adaround_1_5e-2", 1, "adaround", 5e-2),
         ("adaround_2_5e-2", 2, "adaround", 5e-2),
 
-        # ("apot_1_5e-3", 1, "apot", 5e-3),
-        # ("apot_2_5e-3", 2, "apot", 5e-3),
-        # ("apot_1_1e-3", 1, "apot", 1e-3),
-        # ("apot_2_1e-3", 2, "apot", 1e-3),
-        # ("apot_1_1e-2", 1, "apot", 1e-2),
-        # ("apot_2_1e-2", 2, "apot", 1e-2),
+        ("apot_1_5e-3", 1, "apot", 5e-3),
+        ("apot_2_5e-3", 2, "apot", 5e-3),
+        ("apot_1_1e-3", 1, "apot", 1e-3),
+        ("apot_2_1e-3", 2, "apot", 1e-3),
+        ("apot_1_1e-2", 1, "apot", 1e-2),
+        ("apot_2_1e-2", 2, "apot", 1e-2),
         ("apot_1_5e-2", 1, "apot", 5e-2),
         ("apot_2_5e-2", 2, "apot", 5e-2),
 
-        # ("efficientqat_1_5e-3", 1, "efficientqat", 5e-3),
-        # ("efficientqat_2_5e-3", 2, "efficientqat", 5e-3),
-        # ("efficientqat_1_1e-3", 1, "efficientqat", 1e-3),
-        # ("efficientqat_2_1e-3", 2, "efficientqat", 1e-3),
-        # ("efficientqat_1_1e-2", 1, "efficientqat", 1e-2),
-        # ("efficientqat_2_1e-2", 2, "efficientqat", 1e-2),
+        ("efficientqat_1_5e-3", 1, "efficientqat", 5e-3),
+        ("efficientqat_2_5e-3", 2, "efficientqat", 5e-3),
+        ("efficientqat_1_1e-3", 1, "efficientqat", 1e-3),
+        ("efficientqat_2_1e-3", 2, "efficientqat", 1e-3),
+        ("efficientqat_1_1e-2", 1, "efficientqat", 1e-2),
+        ("efficientqat_2_1e-2", 2, "efficientqat", 1e-2),
         ("efficientqat_1_5e-2", 1, "efficientqat", 5e-2),
         ("efficientqat_2_5e-2", 2, "efficientqat", 5e-2),
     ]:
