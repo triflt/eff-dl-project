@@ -24,6 +24,7 @@ MIN_FREQ = 2
 BATCH_SIZE = 32
 BASE_EPOCHS = 1
 QAT_EPOCHS = 1
+N_SAMPLES = 1_000
 
 TOKEN_RE = re.compile(r"\b\w+\b", flags=re.UNICODE)
 
@@ -41,6 +42,7 @@ TOKENIZER_PATH = ARTIFACT_DIR / "tokenizer.json"
 BASE_LOSS_PLOT_PATH = ARTIFACT_DIR / "base_loss.png"
 QAT_LOSS_PLOT_PATH = ARTIFACT_DIR / "qat_loss.png"
 TIMINGS_PATH = ARTIFACT_DIR / "timings.json"
+METRICS_PATH = ARTIFACT_DIR / "metrics.json"
 
 
 def build_vocab(texts: list[list[str]]):
@@ -183,9 +185,8 @@ with TOKENIZER_PATH.open("w", encoding="utf-8") as f:
 print(f"Saved tokenizer to {TOKENIZER_PATH}")
 
 # Datasets
-n_samples = 10_000
-ds_train = TextDataset(train_set, stoi, n_samples)
-ds_test  = TextDataset(test_set, stoi, n_samples)
+ds_train = TextDataset(train_set, stoi, N_SAMPLES)
+ds_test  = TextDataset(test_set, stoi, N_SAMPLES)
 
 # Loaders
 collate = lambda b: collate_batch(b, pad_idx)
@@ -217,6 +218,11 @@ timings = {
     "qat_infer": 0.0,
     "quantized_infer": 0.0,
 }
+metrics = {
+    "train_acc": [],
+    "qat_acc": [],
+    "quantized_acc": [],
+}
 
 for epoch in range(1, BASE_EPOCHS + 1):
     start_time = time.perf_counter()
@@ -229,6 +235,7 @@ for epoch in range(1, BASE_EPOCHS + 1):
     val_loss, val_acc = evaluate(model, dl_test, criterion, device)
     timings["infer"] += time.perf_counter() - start_time
     base_val_losses.append(val_loss)
+    metrics["train_acc"].append(val_acc)
 
     print(f"Epoch {epoch:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%")
     print("\n")
@@ -258,6 +265,7 @@ for epoch in range(1, QAT_EPOCHS + 1):
     val_loss, val_acc = evaluate(model_qat, dl_test, criterion, device)
     timings["qat_infer"] += time.perf_counter() - start_time
     qat_val_losses.append(val_loss)
+    metrics["qat_acc"].append(val_acc)
     print(f"QAT Epoch {epoch:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%")
 
     model_qantized = model_qat.quantize(bits=8, linear_int_class=LinearInt)
@@ -266,6 +274,7 @@ for epoch in range(1, QAT_EPOCHS + 1):
     start_time = time.perf_counter()
     val_loss, val_acc = evaluate(model_qantized, dl_test, criterion, quant_eval_device)
     timings["quantized_infer"] += time.perf_counter() - start_time
+    metrics["quantized_acc"].append(val_acc)
     print(f"Quantized Epoch {epoch:02d} | val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%")
     final_quantized_model = model_qantized
 
@@ -283,3 +292,7 @@ if final_quantized_model is not None:
 with TIMINGS_PATH.open("w", encoding="utf-8") as f:
     json.dump(timings, f, ensure_ascii=True, indent=2)
 print(f"Saved timing information to {TIMINGS_PATH}")
+
+with METRICS_PATH.open("w", encoding="utf-8") as f:
+    json.dump(metrics, f, ensure_ascii=True, indent=2)
+print(f"Saved metrics information to {METRICS_PATH}")
