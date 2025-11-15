@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from datasets import load_dataset
+import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 from sklearn.model_selection import train_test_split
 
@@ -20,6 +22,8 @@ from lsq import QuantLinear, LinearInt
 MAX_VOCAB_SIZE = 20000
 MIN_FREQ = 2
 BATCH_SIZE = 32
+BASE_EPOCHS = 1
+QAT_EPOCHS = 1
 
 TOKEN_RE = re.compile(r"\b\w+\b", flags=re.UNICODE)
 
@@ -34,6 +38,9 @@ ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 BASE_MODEL_PATH = ARTIFACT_DIR / "lstm_base.pt"
 QUANT_MODEL_PATH = ARTIFACT_DIR / "lstm_quantized.pt"
 TOKENIZER_PATH = ARTIFACT_DIR / "tokenizer.json"
+BASE_LOSS_PLOT_PATH = ARTIFACT_DIR / "base_loss.png"
+QAT_LOSS_PLOT_PATH = ARTIFACT_DIR / "qat_loss.png"
+TIMINGS_PATH = ARTIFACT_DIR / "timings.json"
 
 
 def build_vocab(texts: list[list[str]]):
@@ -92,15 +99,38 @@ def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
     return correct / targets.size(0)
 
 
+def save_loss_plot(
+    train_losses: list[float],
+    train_steps: list[int],
+    val_losses: list[float],
+    val_steps: list[int],
+    path: Path,
+    title: str,
+) -> None:
+    plt.figure()
+    plt.plot(train_steps, train_losses, label="Train")
+    if val_losses and val_steps:
+        plt.plot(val_steps, val_losses, label="Validation")
+    plt.xlabel("Iteration")
+    plt.ylabel("Loss")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+    print(f"Saved {title} plot to {path}")
+
+
 def train_epoch(
     model: nn.Module,
     dataloader: DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-) -> float:
+) -> tuple[float, list[float]]:
     model.train()
     epoch_loss = 0.0
+    batch_losses: list[float] = []
     for inputs, lengths, labels in tqdm(dataloader):
         inputs, lengths, labels = inputs.to(device), lengths.to(device), labels.to(device)
 
@@ -110,9 +140,11 @@ def train_epoch(
         loss.backward()
         optimizer.step()
 
-        epoch_loss += loss.item() * inputs.size(0)
+        loss_item = loss.item()
+        batch_losses.append(loss_item)
+        epoch_loss += loss_item * inputs.size(0)
 
-    return epoch_loss / len(dataloader.dataset)
+    return epoch_loss / len(dataloader.dataset), batch_losses
 
 
 @torch.no_grad()
@@ -121,7 +153,7 @@ def evaluate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module, dev
     epoch_loss = 0.0
     epoch_acc = 0.0
     for inputs, lengths, labels in tqdm(dataloader):
-        if inputs.shape[0] < 16:
+        if inputs.shape[0] <= 16:
             continue
         inputs, lengths, labels = inputs.to(device), lengths.to(device), labels.to(device)
         logits = model(inputs, lengths)
@@ -172,11 +204,38 @@ model = LSTMClassifier(
 
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+base_train_losses: list[float] = []
+base_iter_losses: list[float] = []
+base_val_losses: list[float] = []
+qat_train_losses: list[float] = []
+qat_iter_losses: list[float] = []
+qat_val_losses: list[float] = []
+timings = {
+    "train": 0.0,
+    "infer": 0.0,
+    "qat_train": 0.0,
+    "qat_infer": 0.0,
+    "quantized_infer": 0.0,
+}
 
-train_loss = train_epoch(model, dl_train, criterion, optimizer, device)
-val_loss, val_acc = evaluate(model, dl_test, criterion, device)
-print(f"Epoch {1:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%")
-print('\n')
+for epoch in range(1, BASE_EPOCHS + 1):
+    start_time = time.perf_counter()
+    train_loss, batch_losses = train_epoch(model, dl_train, criterion, optimizer, device)
+    timings["train"] += time.perf_counter() - start_time
+    base_train_losses.append(train_loss)
+    base_iter_losses.extend(batch_losses)
+
+    start_time = time.perf_counter()
+    val_loss, val_acc = evaluate(model, dl_test, criterion, device)
+    timings["infer"] += time.perf_counter() - start_time
+    base_val_losses.append(val_loss)
+
+    print(f"Epoch {epoch:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%")
+    print("\n")
+
+base_train_steps = list(range(1, len(base_iter_losses) + 1))
+base_val_steps = [epoch * len(dl_train) for epoch in range(1, len(base_val_losses) + 1)]
+save_loss_plot(base_iter_losses, base_train_steps, base_val_losses, base_val_steps, BASE_LOSS_PLOT_PATH, "Base Model Loss")
 
 model.eval()
 torch.save(model.cpu(), BASE_MODEL_PATH)
@@ -185,22 +244,42 @@ print(f"Saved base model checkpoint to {BASE_MODEL_PATH}")
 model.train()
 
 model_qat = model.to_qat(bits=8, qat_linear_class=QuantLinear)
-optimizer_qa = torch.optim.Adam(model_qat.parameters(), lr=1e-2)
+optimizer_qa = torch.optim.Adam(model_qat.parameters(), lr=3e-4)
 final_quantized_model = None
 
-for i in range(1):
-    train_loss = train_epoch(model_qat, dl_train, criterion, optimizer_qa, device)
+for epoch in range(1, QAT_EPOCHS + 1):
+    start_time = time.perf_counter()
+    train_loss, batch_losses = train_epoch(model_qat, dl_train, criterion, optimizer_qa, device)
+    timings["qat_train"] += time.perf_counter() - start_time
+    qat_train_losses.append(train_loss)
+    qat_iter_losses.extend(batch_losses)
+
+    start_time = time.perf_counter()
     val_loss, val_acc = evaluate(model_qat, dl_test, criterion, device)
-    print(f"Epoch {i:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc*100}%")
+    timings["qat_infer"] += time.perf_counter() - start_time
+    qat_val_losses.append(val_loss)
+    print(f"QAT Epoch {epoch:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%")
 
     model_qantized = model_qat.quantize(bits=8, linear_int_class=LinearInt)
-    model_qantized.to('cpu')
-    val_loss, val_acc = evaluate(model_qantized, dl_test, criterion, 'cpu')
-    print(f"Epoch {i:02d} | val_loss={val_loss:.4f} | val_acc={val_acc*100}%")
+    quant_eval_device = device
+    model_qantized.to(quant_eval_device)
+    start_time = time.perf_counter()
+    val_loss, val_acc = evaluate(model_qantized, dl_test, criterion, quant_eval_device)
+    timings["quantized_infer"] += time.perf_counter() - start_time
+    print(f"Quantized Epoch {epoch:02d} | val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%")
     final_quantized_model = model_qantized
+
+if qat_iter_losses:
+    qat_train_steps = list(range(1, len(qat_iter_losses) + 1))
+    qat_val_steps = [epoch * len(dl_train) for epoch in range(1, len(qat_val_losses) + 1)]
+    save_loss_plot(qat_iter_losses, qat_train_steps, qat_val_losses, qat_val_steps, QAT_LOSS_PLOT_PATH, "QAT Model Loss")
 
 if final_quantized_model is not None:
     final_quantized_model.eval()
     final_quantized_model.to('cpu')
     torch.save(final_quantized_model, QUANT_MODEL_PATH)
     print(f"Saved quantized model checkpoint to {QUANT_MODEL_PATH}")
+
+with TIMINGS_PATH.open("w", encoding="utf-8") as f:
+    json.dump(timings, f, ensure_ascii=True, indent=2)
+print(f"Saved timing information to {TIMINGS_PATH}")
