@@ -7,7 +7,7 @@ import argparse
 import json
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence
 
 import matplotlib.pyplot as plt
 
@@ -86,7 +86,30 @@ def plot_loss_curves(method: str, run_dirs: Sequence[Path], output_path: Path) -
     plt.close()
 
 
-def plot_metric_curves(method: str, run_dirs: Sequence[Path], output_path: Path) -> None:
+def load_base_metrics(artifacts_dir: Path) -> float:
+    """Return the final recorded metric value from the baseline run."""
+    base_metrics: Dict[str, float] = {}
+    metrics_path = artifacts_dir / "base" / "metrics.json"
+    if not metrics_path.exists():
+        return base_metrics
+
+    raw_metrics = load_json(metrics_path)
+    for name, values in raw_metrics.items():
+        if isinstance(values, list):
+            if not values:
+                continue
+            base_metrics[name] = float(values[-1])
+        elif isinstance(values, (int, float)):
+            base_metrics[name] = float(values)
+    return base_metrics['train_acc']
+
+
+def plot_metric_curves(
+    method: str,
+    run_dirs: Sequence[Path],
+    output_path: Path,
+    base_metrics: float,
+) -> None:
     metric_series: Dict[str, List[tuple[str, List[int], List[float]]]] = OrderedDict()
 
     for run_dir in run_dirs:
@@ -112,6 +135,7 @@ def plot_metric_curves(method: str, run_dirs: Sequence[Path], output_path: Path)
     for ax, metric_name in zip(axes.flatten(), metric_names):
         for label, xs, ys in sorted(metric_series[metric_name], key=lambda item: item[0]):
             ax.scatter(xs, ys, label=label)
+        ax.scatter([0], [base_metrics], label="base", marker="x", color="black")
         ax.set_title(f"{method.upper()} {metric_name}")
         ax.set_xlabel("Measurement")
         ax.set_ylabel(metric_name)
@@ -188,6 +212,7 @@ def main() -> None:
     artifacts_dir = args.artifacts_dir.resolve()
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    base_metrics = load_base_metrics(artifacts_dir)
 
     for method in args.methods:
         run_dirs = iter_method_runs(artifacts_dir, method)
@@ -196,7 +221,9 @@ def main() -> None:
             continue
         method_out = output_dir / method
         plot_loss_curves(method, run_dirs, method_out / f"{method}_losses.png")
-        plot_metric_curves(method, run_dirs, method_out / f"{method}_metrics.png")
+        plot_metric_curves(
+            method, run_dirs, method_out / f"{method}_metrics.png", base_metrics
+        )
 
     timing_runs = collect_timing_runs(artifacts_dir, args.methods)
     timing_out = output_dir / "timings"
