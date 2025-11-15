@@ -1,18 +1,21 @@
+import json
 import re
 from collections import Counter
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from datasets import load_dataset
 from tqdm.auto import tqdm
+from sklearn.model_selection import train_test_split
 
 from lstm import LSTMClassifier
-# from lsq import QuantLinear, LinearInt
+from lsq import QuantLinear, LinearInt
 # from pact import QuantLinear, LinearInt
 # from adaround import QuantLinear, LinearInt
 # from apot import QuantLinear, LinearInt
-from efficientqat import QuantLinear, LinearInt
+# from efficientqat import QuantLinear, LinearInt
 
 MAX_VOCAB_SIZE = 20000
 MIN_FREQ = 2
@@ -26,6 +29,11 @@ def tokenize(s: str) -> list[str]:
 
 
 PAD, UNK = "<pad>", "<unk>"
+ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts" / "lsq"
+ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+BASE_MODEL_PATH = ARTIFACT_DIR / "lstm_base.pt"
+QUANT_MODEL_PATH = ARTIFACT_DIR / "lstm_quantized.pt"
+TOKENIZER_PATH = ARTIFACT_DIR / "tokenizer.json"
 
 
 def build_vocab(texts: list[list[str]]):
@@ -49,9 +57,12 @@ def encode(tokens: list[str], stoi: dict) -> list[int]:
 
 
 class TextDataset(Dataset):
-    def __init__(self, data, stoi):
-        self.labels = data['label']
-        self.texts = [encode(tokenize(x), stoi) for x in data['text']]
+    def __init__(self, data, stoi, n_samples):
+        text, _, label, _ = train_test_split(
+            data['text'], data['label'], shuffle=True, random_state=42, train_size=n_samples
+        )
+        self.labels = label
+        self.texts = [encode(tokenize(x), stoi) for x in text]
 
     def __len__(self):
         return len(self.labels)
@@ -128,10 +139,21 @@ stoi, itos = build_vocab(all_tokens)
 pad_idx = stoi[PAD]
 vocab_size = len(itos)
 print(f"Vocab size: {vocab_size}")
+tokenizer_payload = {
+    "stoi": stoi,
+    "itos": itos,
+    "pad_idx": pad_idx,
+    "pad_token": PAD,
+    "unk_token": UNK,
+}
+with TOKENIZER_PATH.open("w", encoding="utf-8") as f:
+    json.dump(tokenizer_payload, f, ensure_ascii=True, indent=2)
+print(f"Saved tokenizer to {TOKENIZER_PATH}")
 
 # Datasets
-ds_train = TextDataset(train_set[:10_000], stoi)
-ds_test  = TextDataset(test_set[:10_000], stoi)
+n_samples = 10_000
+ds_train = TextDataset(train_set, stoi, n_samples)
+ds_test  = TextDataset(test_set, stoi, n_samples)
 
 # Loaders
 collate = lambda b: collate_batch(b, pad_idx)
@@ -156,11 +178,17 @@ val_loss, val_acc = evaluate(model, dl_test, criterion, device)
 print(f"Epoch {1:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%")
 print('\n')
 
+model.eval()
+torch.save(model.cpu(), BASE_MODEL_PATH)
+model.to(device)
+print(f"Saved base model checkpoint to {BASE_MODEL_PATH}")
+model.train()
 
 model_qat = model.to_qat(bits=8, qat_linear_class=QuantLinear)
 optimizer_qa = torch.optim.Adam(model_qat.parameters(), lr=1e-2)
+final_quantized_model = None
 
-for i in range(5):
+for i in range(1):
     train_loss = train_epoch(model_qat, dl_train, criterion, optimizer_qa, device)
     val_loss, val_acc = evaluate(model_qat, dl_test, criterion, device)
     print(f"Epoch {i:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc*100}%")
@@ -169,3 +197,10 @@ for i in range(5):
     model_qantized.to('cpu')
     val_loss, val_acc = evaluate(model_qantized, dl_test, criterion, 'cpu')
     print(f"Epoch {i:02d} | val_loss={val_loss:.4f} | val_acc={val_acc*100}%")
+    final_quantized_model = model_qantized
+
+if final_quantized_model is not None:
+    final_quantized_model.eval()
+    final_quantized_model.to('cpu')
+    torch.save(final_quantized_model, QUANT_MODEL_PATH)
+    print(f"Saved quantized model checkpoint to {QUANT_MODEL_PATH}")
