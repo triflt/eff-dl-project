@@ -120,7 +120,7 @@ def plot_metric_curves(
         for metric_name, values in metrics.items():
             if not isinstance(values, list):
                 continue
-            xs = list(range(len(values)))
+            xs = list(range(1, len(values) + 1))
             ys = [float(v) for v in values]
             metric_series.setdefault(metric_name, []).append((run_dir.name, xs, ys))
 
@@ -135,7 +135,7 @@ def plot_metric_curves(
     for ax, metric_name in zip(axes.flatten(), metric_names):
         for label, xs, ys in sorted(metric_series[metric_name], key=lambda item: item[0]):
             ax.scatter(xs, ys, label=label)
-        ax.scatter([0], [base_metrics], label="base", marker="x", color="black")
+        ax.scatter([1], [base_metrics], label="base", marker="x", color="black")
         ax.set_title(f"{method.upper()} {metric_name}")
         ax.set_xlabel("Epoch")
         ax.set_ylabel(metric_name)
