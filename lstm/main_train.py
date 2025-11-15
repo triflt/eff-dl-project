@@ -362,55 +362,87 @@ def _save_model_checkpoint(model: nn.Module, path: Path) -> None:
         model.to(original_device)
 
 
-def save_artifacts(
+def _prepare_artifact_dir(name: str) -> Path:
+    artifact_dir = Path(__file__).resolve().parent / "artifacts" / name
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    return artifact_dir
+
+
+def _merge_and_save_json(path: Path, payload: dict[str, Any]) -> None:
+    existing: dict[str, Any] = {}
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            try:
+                existing = json.load(f)
+            except json.JSONDecodeError:
+                existing = {}
+    existing.update(payload)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(existing, f, ensure_ascii=True, indent=2)
+
+
+def save_base_artifacts(
     name: str,
     model: Optional[nn.Module],
     tokenizer: Optional[dict[str, Any]],
+    timings: dict[str, float],
+    metrics: dict[str, list[float]],
+    losses: dict[str, list[float]],
+) -> None:
+    artifact_dir = _prepare_artifact_dir(name)
+    base_model_path = artifact_dir / "lstm_base.pt"
+    tokenizer_path = artifact_dir / "tokenizer.json"
+    base_loss_plot_path = artifact_dir / "base_loss.png"
+    timings_path = artifact_dir / "timings.json"
+    metrics_path = artifact_dir / "metrics.json"
+
+    if tokenizer is not None:
+        with tokenizer_path.open("w", encoding="utf-8") as f:
+            json.dump(tokenizer, f, ensure_ascii=True, indent=2)
+        print(f"Saved tokenizer to {tokenizer_path}")
+
+    if model is not None:
+        _save_model_checkpoint(model.eval(), base_model_path)
+
+    if losses.get("train"):
+        base_steps = list(range(1, len(losses["train"]) + 1))
+        save_loss_plot(losses["train"], base_steps, base_loss_plot_path, "Base Model Loss")
+
+    _merge_and_save_json(timings_path, timings)
+    print(f"Saved base timing information to {timings_path}")
+
+    _merge_and_save_json(metrics_path, metrics)
+    print(f"Saved base metrics information to {metrics_path}")
+
+
+def save_qat_artifacts(
+    name: str,
     quantized_model: Optional[nn.Module],
     timings: dict[str, float],
     metrics: dict[str, list[float]],
-    base_losses: dict[str, list[float]],
-    qat_losses: dict[str, list[float]],
+    losses: dict[str, list[float]],
 ) -> None:
-    ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts" / name
-    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    BASE_MODEL_PATH = ARTIFACT_DIR / "lstm_base.pt"
-    QUANT_MODEL_PATH = ARTIFACT_DIR / "lstm_quantized.pt"
-    TOKENIZER_PATH = ARTIFACT_DIR / "tokenizer.json"
-    BASE_LOSS_PLOT_PATH = ARTIFACT_DIR / "base_loss.png"
-    QAT_LOSS_PLOT_PATH = ARTIFACT_DIR / "qat_loss.png"
-    TIMINGS_PATH = ARTIFACT_DIR / "timings.json"
-    METRICS_PATH = ARTIFACT_DIR / "metrics.json"
-
-    if tokenizer is not None:
-        with TOKENIZER_PATH.open("w", encoding="utf-8") as f:
-            json.dump(tokenizer, f, ensure_ascii=True, indent=2)
-        print(f"Saved tokenizer to {TOKENIZER_PATH}")
-
-    if model is not None:
-        _save_model_checkpoint(model.eval(), BASE_MODEL_PATH)
+    artifact_dir = _prepare_artifact_dir(name)
+    quant_model_path = artifact_dir / "lstm_quantized.pt"
+    qat_loss_plot_path = artifact_dir / "qat_loss.png"
+    timings_path = artifact_dir / "timings.json"
+    metrics_path = artifact_dir / "metrics.json"
 
     if quantized_model is not None:
         quantized_model.eval()
         quantized_model_cpu = quantized_model.to("cpu")
-        torch.save(quantized_model_cpu, QUANT_MODEL_PATH)
-        print(f"Saved quantized model checkpoint to {QUANT_MODEL_PATH}")
+        torch.save(quantized_model_cpu, quant_model_path)
+        print(f"Saved quantized model checkpoint to {quant_model_path}")
 
-    if base_losses.get("train"):
-        base_steps = list(range(1, len(base_losses["train"]) + 1))
-        save_loss_plot(base_losses["train"], base_steps, BASE_LOSS_PLOT_PATH, "Base Model Loss")
+    if losses.get("qat_train"):
+        qat_steps = list(range(1, len(losses["qat_train"]) + 1))
+        save_loss_plot(losses["qat_train"], qat_steps, qat_loss_plot_path, "QAT Model Loss")
 
-    if qat_losses.get("qat_train"):
-        qat_steps = list(range(1, len(qat_losses["qat_train"]) + 1))
-        save_loss_plot(qat_losses["qat_train"], qat_steps, QAT_LOSS_PLOT_PATH, "QAT Model Loss")
+    _merge_and_save_json(timings_path, timings)
+    print(f"Saved QAT timing information to {timings_path}")
 
-    with TIMINGS_PATH.open("w", encoding="utf-8") as f:
-        json.dump(timings, f, ensure_ascii=True, indent=2)
-    print(f"Saved timing information to {TIMINGS_PATH}")
-
-    with METRICS_PATH.open("w", encoding="utf-8") as f:
-        json.dump(metrics, f, ensure_ascii=True, indent=2)
-    print(f"Saved metrics information to {METRICS_PATH}")
+    _merge_and_save_json(metrics_path, metrics)
+    print(f"Saved QAT metrics information to {metrics_path}")
 
 
 def main() -> None:
@@ -427,31 +459,60 @@ def main() -> None:
         epochs=1,
     )
 
+    save_base_artifacts(
+        name='base',
+        model=base_model,
+        tokenizer=tokenizer,
+        timings=base_timings,
+        metrics=base_metrics,
+        losses=base_losses,
+    )
+
     for name, epochs, qat_method, lr in [
-        ("lsq_1_5e-3", 1, "lsq", 5e-3),
-        ("lsq_2_5e-3", 2, "lsq", 5e-3),
-        ("lsq_1_1e-3", 1, "lsq", 1e-3),
-        ("lsq_2_1e-3", 2, "lsq", 1e-3),
+        # ("lsq_1_5e-3", 1, "lsq", 5e-3),
+        # ("lsq_2_5e-3", 2, "lsq", 5e-3),
+        # ("lsq_1_1e-3", 1, "lsq", 1e-3),
+        # ("lsq_2_1e-3", 2, "lsq", 1e-3),
+        # ("lsq_1_1e-2", 1, "lsq", 1e-2),
+        # ("lsq_2_1e-2", 2, "lsq", 1e-2),
+        ("lsq_1_5e-2", 1, "lsq", 5e-2),
+        ("lsq_2_5e-2", 2, "lsq", 5e-2),
 
-        ("pact_1_5e-3", 1, "pact", 5e-3),
-        ("pact_2_5e-3", 2, "pact", 5e-3),
-        ("pact_1_1e-3", 1, "pact", 1e-3),
-        ("pact_2_1e-3", 2, "pact", 1e-3),
+        # ("pact_1_5e-3", 1, "pact", 5e-3),
+        # ("pact_2_5e-3", 2, "pact", 5e-3),
+        # ("pact_1_1e-3", 1, "pact", 1e-3),
+        # ("pact_2_1e-3", 2, "pact", 1e-3),
+        # ("pact_1_1e-2", 1, "pact", 1e-2),
+        # ("pact_2_1e-2", 2, "pact", 1e-2),
+        ("pact_1_5e-2", 1, "pact", 5e-2),
+        ("pact_2_5e-2", 2, "pact", 5e-2),
 
-        ("adaround_1_5e-3", 1, "adaround", 5e-3),
-        ("adaround_2_5e-3", 2, "adaround", 5e-3),
-        ("adaround_1_1e-3", 1, "adaround", 1e-3),
-        ("adaround_2_1e-3", 2, "adaround", 1e-3),
+        # ("adaround_1_5e-3", 1, "adaround", 5e-3),
+        # ("adaround_2_5e-3", 2, "adaround", 5e-3),
+        # ("adaround_1_1e-3", 1, "adaround", 1e-3),
+        # ("adaround_2_1e-3", 2, "adaround", 1e-3),
+        # ("adaround_1_1e-2", 1, "adaround", 1e-2),
+        # ("adaround_2_1e-2", 2, "adaround", 1e-2),
+        ("adaround_1_5e-2", 1, "adaround", 5e-2),
+        ("adaround_2_5e-2", 2, "adaround", 5e-2),
 
-        ("apot_1_5e-3", 1, "apot", 5e-3),
-        ("apot_2_5e-3", 2, "apot", 5e-3),
-        ("apot_1_1e-3", 1, "apot", 1e-3),
-        ("apot_2_1e-3", 2, "apot", 1e-3),
+        # ("apot_1_5e-3", 1, "apot", 5e-3),
+        # ("apot_2_5e-3", 2, "apot", 5e-3),
+        # ("apot_1_1e-3", 1, "apot", 1e-3),
+        # ("apot_2_1e-3", 2, "apot", 1e-3),
+        # ("apot_1_1e-2", 1, "apot", 1e-2),
+        # ("apot_2_1e-2", 2, "apot", 1e-2),
+        ("apot_1_5e-2", 1, "apot", 5e-2),
+        ("apot_2_5e-2", 2, "apot", 5e-2),
 
-        ("efficientqat_1_5e-3", 1, "efficientqat", 5e-3),
-        ("efficientqat_2_5e-3", 2, "efficientqat", 5e-3),
-        ("efficientqat_1_1e-3", 1, "efficientqat", 1e-3),
-        ("efficientqat_2_1e-3", 2, "efficientqat", 1e-3),
+        # ("efficientqat_1_5e-3", 1, "efficientqat", 5e-3),
+        # ("efficientqat_2_5e-3", 2, "efficientqat", 5e-3),
+        # ("efficientqat_1_1e-3", 1, "efficientqat", 1e-3),
+        # ("efficientqat_2_1e-3", 2, "efficientqat", 1e-3),
+        # ("efficientqat_1_1e-2", 1, "efficientqat", 1e-2),
+        # ("efficientqat_2_1e-2", 2, "efficientqat", 1e-2),
+        ("efficientqat_1_5e-2", 1, "efficientqat", 5e-2),
+        ("efficientqat_2_5e-2", 2, "efficientqat", 5e-2),
     ]:
         quantized_model, qat_timings, qat_metrics, qat_losses = train_qat_models(
             train_samples,
@@ -464,17 +525,12 @@ def main() -> None:
             qat_method=qat_method,
         )
 
-        timings = {**base_timings, **qat_timings}
-        metrics = {**base_metrics, **qat_metrics}
-        save_artifacts(
+        save_qat_artifacts(
             name=name,
-            model=base_model,
-            tokenizer=tokenizer,
             quantized_model=quantized_model,
-            timings=timings,
-            metrics=metrics,
-            base_losses=base_losses,
-            qat_losses=qat_losses,
+            timings=qat_timings,
+            metrics=qat_metrics,
+            losses=qat_losses,
         )
 
 

@@ -18,9 +18,8 @@ TOKEN_RE = re.compile(r"\b\w+\b", flags=re.UNICODE)
 PAD, UNK = "<pad>", "<unk>"
 
 ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts"
-DEFAULT_BASE_MODEL_PATH = ARTIFACT_DIR / "lstm_base.pt"
-DEFAULT_QUANT_MODEL_PATH = ARTIFACT_DIR / "lstm_quantized.pt"
-DEFAULT_TOKENIZER_PATH = ARTIFACT_DIR / "tokenizer.json"
+DEFAULT_BASE_MODEL_PATH = ARTIFACT_DIR / 'base' / "lstm_base.pt"
+DEFAULT_TOKENIZER_PATH = ARTIFACT_DIR / 'base' / "tokenizer.json"
 
 
 def tokenize(text: str) -> list[str]:
@@ -66,12 +65,6 @@ def run_inference(model: LSTMClassifier, stoi: dict[str, int], pad_idx: int, tex
 def main():
     parser = argparse.ArgumentParser(description="Run interactive inference with a saved LSTM classifier.")
     parser.add_argument(
-        "--model-type",
-        choices=["base", "quantized"],
-        default="base",
-        help="Choose which checkpoint to load. Defaults to the floating-point base model.",
-    )
-    parser.add_argument(
         "--model-path",
         type=Path,
         help="Optional path to the checkpoint. Defaults to artifacts/lstm_base.pt or lstm_quantized.pt.",
@@ -84,13 +77,13 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.model_type == "quantized":
-        device = torch.device("cpu")
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    default_model_path = DEFAULT_BASE_MODEL_PATH if args.model_type == "base" else DEFAULT_QUANT_MODEL_PATH
-    model_path = args.model_path or default_model_path
+    print(args.model_path)
+    if args.model_path is not None:
+        model_path = ARTIFACT_DIR / args.model_path / "lstm_quantized.pt"
+    else:
+        model_path = DEFAULT_BASE_MODEL_PATH
     model_path = model_path.resolve()
     if not model_path.exists():
         raise FileNotFoundError(f"Checkpoint not found at {model_path}")
@@ -104,7 +97,7 @@ def main():
     print(model)
     model.to(device)
 
-    print(f"Loaded {args.model_type} model from {model_path}")
+    print(f"Loaded model from {model_path}")
     print("Press Enter on an empty line to exit.")
 
     while True:
