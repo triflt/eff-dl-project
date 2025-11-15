@@ -3,6 +3,7 @@ import re
 import time
 from collections import Counter
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,7 @@ from datasets import load_dataset
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 from sklearn.model_selection import train_test_split
+from torch.optim.lr_scheduler import _LRScheduler
 
 from lstm import LSTMClassifier
 from lsq import QuantLinear, LinearInt
@@ -129,6 +131,7 @@ def train_epoch(
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    scheduler: Optional[_LRScheduler] = None,
 ) -> tuple[float, list[float]]:
     model.train()
     epoch_loss = 0.0
@@ -141,6 +144,8 @@ def train_epoch(
         loss = criterion(logits, labels)
         loss.backward()
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         loss_item = loss.item()
         batch_losses.append(loss_item)
@@ -205,10 +210,10 @@ model = LSTMClassifier(
 
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-base_train_losses: list[float] = []
+base_total_steps = max(1, BASE_EPOCHS * len(dl_train))
+base_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=base_total_steps)
 base_iter_losses: list[float] = []
 base_val_losses: list[float] = []
-qat_train_losses: list[float] = []
 qat_iter_losses: list[float] = []
 qat_val_losses: list[float] = []
 timings = {
@@ -226,9 +231,8 @@ metrics = {
 
 for epoch in range(1, BASE_EPOCHS + 1):
     start_time = time.perf_counter()
-    train_loss, batch_losses = train_epoch(model, dl_train, criterion, optimizer, device)
+    train_loss, batch_losses = train_epoch(model, dl_train, criterion, optimizer, device, scheduler=base_scheduler)
     timings["train"] += time.perf_counter() - start_time
-    base_train_losses.append(train_loss)
     base_iter_losses.extend(batch_losses)
 
     start_time = time.perf_counter()
@@ -252,13 +256,16 @@ model.train()
 
 model_qat = model.to_qat(bits=8, qat_linear_class=QuantLinear)
 optimizer_qa = torch.optim.AdamW(model_qat.parameters(), lr=1e-4)
+qat_total_steps = max(1, QAT_EPOCHS * len(dl_train))
+qat_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_qa, T_max=qat_total_steps)
 final_quantized_model = None
 
 for epoch in range(1, QAT_EPOCHS + 1):
     start_time = time.perf_counter()
-    train_loss, batch_losses = train_epoch(model_qat, dl_train, criterion, optimizer_qa, device)
+    train_loss, batch_losses = train_epoch(
+        model_qat, dl_train, criterion, optimizer_qa, device, scheduler=qat_scheduler
+    )
     timings["qat_train"] += time.perf_counter() - start_time
-    qat_train_losses.append(train_loss)
     qat_iter_losses.extend(batch_losses)
 
     start_time = time.perf_counter()
