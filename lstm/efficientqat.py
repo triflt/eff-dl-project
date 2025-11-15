@@ -245,7 +245,7 @@ class QuantLinear(nn.Module):
         bit: int,
         group_size: int | None = None,
         use_act_quant: bool = True,
-        act_signed: bool = False,
+        act_signed: bool = True,
     ) -> None:
         super().__init__()
         self.fc = nn.Linear(in_features, out_features, bias=True)
