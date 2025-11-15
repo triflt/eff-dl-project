@@ -1,31 +1,32 @@
+import os
+import zipfile
+import io
 import json
 import re
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Optional
 
+import requests
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-from datasets import load_dataset
+from torch.utils.data import DataLoader, Dataset, random_split
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
-from sklearn.model_selection import train_test_split
 
 from lstm import LSTMClassifier
-from lsq import QuantLinear, LinearInt
-# from pact import QuantLinear, LinearInt
+# from lsq import QuantLinear, LinearInt
+from pact import QuantLinear, LinearInt
 # from adaround import QuantLinear, LinearInt
 # from apot import QuantLinear, LinearInt
 # from efficientqat import QuantLinear, LinearInt
 
+torch.manual_seed(0)
 MAX_VOCAB_SIZE = 20000
 MIN_FREQ = 2
 BATCH_SIZE = 64
 BASE_EPOCHS = 1
-QAT_EPOCHS = 1
-N_SAMPLES = 10_000
+QAT_EPOCHS = 2
 
 TOKEN_RE = re.compile(r"\b\w+\b", flags=re.UNICODE)
 
@@ -34,8 +35,10 @@ def tokenize(s: str) -> list[str]:
     return TOKEN_RE.findall(s.lower())
 
 
+DATA_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/00228/smsspamcollection.zip"
+DATA_DIR = "./data"
 PAD, UNK = "<pad>", "<unk>"
-ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts" / "lsq"
+ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts" / "pact"
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 BASE_MODEL_PATH = ARTIFACT_DIR / "lstm_base.pt"
 QUANT_MODEL_PATH = ARTIFACT_DIR / "lstm_quantized.pt"
@@ -45,6 +48,30 @@ QAT_LOSS_PLOT_PATH = ARTIFACT_DIR / "qat_loss.png"
 TIMINGS_PATH = ARTIFACT_DIR / "timings.json"
 METRICS_PATH = ARTIFACT_DIR / "metrics.json"
 
+
+def download_sms_dataset() -> list[tuple[int, str]]:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    zip_path = os.path.join(DATA_DIR, "smsspam.zip")
+    txt_path = os.path.join(DATA_DIR, "SMSSpamCollection")
+
+    if not os.path.exists(txt_path):
+        print("Downloading dataset...")
+        r = requests.get(DATA_URL, timeout=30)
+        r.raise_for_status()
+        with open(zip_path, "wb") as f:
+            f.write(r.content)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(DATA_DIR)
+    else:
+        print("Dataset already present.")
+
+    data = []
+    with io.open(txt_path, encoding="utf-8") as f:
+        for line in f:
+            label, text = line.strip().split("\t", 1)
+            y = 1 if label == "spam" else 0
+            data.append((y, text))
+    return data
 
 def build_vocab(texts: list[list[str]]):
     counter = Counter()
@@ -67,12 +94,9 @@ def encode(tokens: list[str], stoi: dict) -> list[int]:
 
 
 class TextDataset(Dataset):
-    def __init__(self, data, stoi, n_samples):
-        text, _, label, _ = train_test_split(
-            data['text'], data['label'], shuffle=True, random_state=42, train_size=n_samples
-        )
-        self.labels = label
-        self.texts = [encode(tokenize(x), stoi) for x in text]
+    def __init__(self, samples, stoi):
+        self.labels = [y for y, _ in samples]
+        self.texts = [encode(tokenize(x), stoi) for _, x in samples]
 
     def __len__(self):
         return len(self.labels)
@@ -105,15 +129,11 @@ def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
 def save_loss_plot(
     train_losses: list[float],
     train_steps: list[int],
-    val_losses: list[float],
-    val_steps: list[int],
     path: Path,
     title: str,
 ) -> None:
     plt.figure()
     plt.plot(train_steps, train_losses, label="Train")
-    if val_losses and val_steps:
-        plt.plot(val_steps, val_losses, label="Validation")
     plt.xlabel("Iteration")
     plt.ylabel("Loss")
     plt.title(title)
@@ -170,9 +190,12 @@ def evaluate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module, dev
     dataset_size = len(dataloader.dataset)
     return epoch_loss / dataset_size, epoch_acc / dataset_size
 
-train_set, test_set = load_dataset("stanfordnlp/imdb", split=['train', 'test'])
+data = download_sms_dataset()
+# Tokenize once to build vocab on train only
+train_p = 0.7
+train_set, test_set = random_split(data, lengths=(train_p, 1 - train_p))
 
-all_tokens = [tokenize(txt) for txt in train_set['text']]
+all_tokens = [tokenize(txt) for _, txt in train_set]
 stoi, itos = build_vocab(all_tokens)
 pad_idx = stoi[PAD]
 vocab_size = len(itos)
@@ -189,8 +212,8 @@ with TOKENIZER_PATH.open("w", encoding="utf-8") as f:
 print(f"Saved tokenizer to {TOKENIZER_PATH}")
 
 # Datasets
-ds_train = TextDataset(train_set, stoi, N_SAMPLES)
-ds_test  = TextDataset(test_set, stoi, N_SAMPLES)
+ds_train = TextDataset(train_set, stoi)
+ds_test  = TextDataset(test_set, stoi)
 
 # Loaders
 collate = lambda b: collate_batch(b, pad_idx)
@@ -213,9 +236,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 base_total_steps = max(1, BASE_EPOCHS * len(dl_train))
 base_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=base_total_steps)
 base_iter_losses: list[float] = []
-base_val_losses: list[float] = []
 qat_iter_losses: list[float] = []
-qat_val_losses: list[float] = []
 timings = {
     "train": 0.0,
     "infer": 0.0,
@@ -238,15 +259,13 @@ for epoch in range(1, BASE_EPOCHS + 1):
     start_time = time.perf_counter()
     val_loss, val_acc = evaluate(model, dl_test, criterion, device)
     timings["infer"] += time.perf_counter() - start_time
-    base_val_losses.append(val_loss)
     metrics["train_acc"].append(val_acc)
 
     print(f"Epoch {epoch:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%")
     print("\n")
 
 base_train_steps = list(range(1, len(base_iter_losses) + 1))
-base_val_steps = [epoch * len(dl_train) for epoch in range(1, len(base_val_losses) + 1)]
-save_loss_plot(base_iter_losses, base_train_steps, base_val_losses, base_val_steps, BASE_LOSS_PLOT_PATH, "Base Model Loss")
+save_loss_plot(base_iter_losses, base_train_steps, BASE_LOSS_PLOT_PATH, "Base Model Loss")
 
 model.eval()
 torch.save(model.cpu(), BASE_MODEL_PATH)
@@ -257,8 +276,8 @@ model.train()
 model_qat = model.to_qat(bits=8, qat_linear_class=QuantLinear)
 del model
 torch.cuda.empty_cache()
-optimizer_qa = torch.optim.AdamW(model_qat.parameters(), lr=1e-2)
-qat_total_steps = max(1, QAT_EPOCHS * len(dl_train)) * 2
+optimizer_qa = torch.optim.AdamW(model_qat.parameters(), lr=5e-3)
+qat_total_steps = max(1, QAT_EPOCHS * len(dl_train))
 qat_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_qa, T_max=qat_total_steps)
 final_quantized_model = None
 
@@ -273,7 +292,6 @@ for epoch in range(1, QAT_EPOCHS + 1):
     start_time = time.perf_counter()
     val_loss, val_acc = evaluate(model_qat, dl_test, criterion, device)
     timings["qat_infer"] += time.perf_counter() - start_time
-    qat_val_losses.append(val_loss)
     metrics["qat_acc"].append(val_acc)
     print(f"QAT Epoch {epoch:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%")
 
@@ -289,8 +307,7 @@ for epoch in range(1, QAT_EPOCHS + 1):
 
 if qat_iter_losses:
     qat_train_steps = list(range(1, len(qat_iter_losses) + 1))
-    qat_val_steps = [epoch * len(dl_train) for epoch in range(1, len(qat_val_losses) + 1)]
-    save_loss_plot(qat_iter_losses, qat_train_steps, qat_val_losses, qat_val_steps, QAT_LOSS_PLOT_PATH, "QAT Model Loss")
+    save_loss_plot(qat_iter_losses, qat_train_steps, QAT_LOSS_PLOT_PATH, "QAT Model Loss")
 
 if final_quantized_model is not None:
     final_quantized_model.eval()

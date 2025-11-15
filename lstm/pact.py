@@ -58,7 +58,7 @@ class Quantizer(nn.Module):
         alpha_shape = [1] * x.dim()
         alpha_shape[self.channel_dim] = num_channels
         alpha = torch.full(alpha_shape, self._init_alpha_value, device=x.device, dtype=x.dtype)
-        self.alpha = nn.Parameter(alpha)
+        self.alpha = nn.Parameter(alpha).to(x.device)
         self._alpha_initialized = True
 
     def forward(self, x: torch.Tensor):
@@ -199,9 +199,6 @@ class LinearInt(nn.Linear):
             self.quantizer_act.alpha = nn.Parameter(alpha, requires_grad=False)
 
     def forward(self, input_x):
-        if input_x.device.type != 'cpu':
-            input_x = input_x.cpu()
-
         if self.quantizer_act is None:
             raise RuntimeError("Activation quantizer is not initialized.")
 
