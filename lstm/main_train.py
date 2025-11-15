@@ -1,13 +1,11 @@
-import os
-import io
 import re
-import zipfile
 from collections import Counter
 
-import requests
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
+from datasets import load_dataset
+from tqdm.auto import tqdm
 
 from lstm import LSTMClassifier
 # from lsq import QuantLinear, LinearInt
@@ -16,35 +14,9 @@ from lstm import LSTMClassifier
 # from apot import QuantLinear, LinearInt
 from efficientqat import QuantLinear, LinearInt
 
-DATA_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/00228/smsspamcollection.zip"
-DATA_DIR = "./data"
 MAX_VOCAB_SIZE = 20000
 MIN_FREQ = 2
 BATCH_SIZE = 32
-
-def download_sms_dataset() -> list[tuple[int, str]]:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    zip_path = os.path.join(DATA_DIR, "smsspam.zip")
-    txt_path = os.path.join(DATA_DIR, "SMSSpamCollection")
-
-    if not os.path.exists(txt_path):
-        print("Downloading dataset...")
-        r = requests.get(DATA_URL, timeout=30)
-        r.raise_for_status()
-        with open(zip_path, "wb") as f:
-            f.write(r.content)
-        with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(DATA_DIR)
-    else:
-        print("Dataset already present.")
-
-    data = []
-    with io.open(txt_path, encoding="utf-8") as f:
-        for line in f:
-            label, text = line.strip().split("\t", 1)
-            y = 1 if label == "spam" else 0
-            data.append((y, text))
-    return data
 
 TOKEN_RE = re.compile(r"\b\w+\b", flags=re.UNICODE)
 
@@ -76,13 +48,10 @@ def encode(tokens: list[str], stoi: dict) -> list[int]:
     return [stoi.get(t, unk) for t in tokens]
 
 
-# ----------------------------
-# Dataset with dynamic padding
-# ----------------------------
-class SMSDataset(Dataset):
-    def __init__(self, samples, stoi):
-        self.labels = [y for y, _ in samples]
-        self.texts = [encode(tokenize(x), stoi) for _, x in samples]
+class TextDataset(Dataset):
+    def __init__(self, data, stoi):
+        self.labels = data['label']
+        self.texts = [encode(tokenize(x), stoi) for x in data['text']]
 
     def __len__(self):
         return len(self.labels)
@@ -121,7 +90,7 @@ def train_epoch(
 ) -> float:
     model.train()
     epoch_loss = 0.0
-    for inputs, lengths, labels in dataloader:
+    for inputs, lengths, labels in tqdm(dataloader):
         inputs, lengths, labels = inputs.to(device), lengths.to(device), labels.to(device)
 
         optimizer.zero_grad()
@@ -140,7 +109,7 @@ def evaluate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module, dev
     model.eval()
     epoch_loss = 0.0
     epoch_acc = 0.0
-    for inputs, lengths, labels in dataloader:
+    for inputs, lengths, labels in tqdm(dataloader):
         if inputs.shape[0] < 16:
             continue
         inputs, lengths, labels = inputs.to(device), lengths.to(device), labels.to(device)
@@ -152,20 +121,17 @@ def evaluate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module, dev
     dataset_size = len(dataloader.dataset)
     return epoch_loss / dataset_size, epoch_acc / dataset_size
 
-data = download_sms_dataset()
-# Tokenize once to build vocab on train only
-train_p = 0.7
-train_set, test_set = random_split(data, lengths=(train_p, 1 - train_p))
+train_set, test_set = load_dataset("stanfordnlp/imdb", split=['train', 'test'])
 
-all_tokens = [tokenize(txt) for _, txt in data]
+all_tokens = [tokenize(txt) for txt in train_set['text']]
 stoi, itos = build_vocab(all_tokens)
 pad_idx = stoi[PAD]
 vocab_size = len(itos)
 print(f"Vocab size: {vocab_size}")
 
 # Datasets
-ds_train = SMSDataset(train_set, stoi)
-ds_test  = SMSDataset(test_set, stoi)
+ds_train = TextDataset(train_set[:10_000], stoi)
+ds_test  = TextDataset(test_set[:10_000], stoi)
 
 # Loaders
 collate = lambda b: collate_batch(b, pad_idx)
@@ -176,14 +142,14 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model = LSTMClassifier(
     vocab_size=vocab_size,
-    embed_dim=64,
-    hidden_dim=64,
+    embed_dim=48,
+    hidden_dim=48,
     num_classes=2,
     pad_idx=pad_idx,
 ).to(device)
 
 criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
 train_loss = train_epoch(model, dl_train, criterion, optimizer, device)
 val_loss, val_acc = evaluate(model, dl_test, criterion, device)
