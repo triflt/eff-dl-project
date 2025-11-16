@@ -7,7 +7,7 @@ import argparse
 import json
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 
@@ -35,6 +35,11 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=QAT_METHODS,
         help="QAT methods to include (defaults to lsq, pact, adaround, apot, efficientqat).",
+    )
+    parser.add_argument(
+        "--comparison-metric",
+        default="quantized_acc",
+        help="Metric key to use when comparing the best run for each QAT method.",
     )
     return parser.parse_args()
 
@@ -148,6 +153,70 @@ def plot_metric_curves(
     plt.close(fig)
 
 
+def collect_best_metrics(
+    artifacts_dir: Path, methods: Iterable[str], metric_name: str
+) -> "OrderedDict[str, Tuple[float, str]]":
+    """Return the best metric per QAT method."""
+    best_metrics: "OrderedDict[str, Tuple[float, str]]" = OrderedDict()
+    for method in methods:
+        run_dirs = iter_method_runs(artifacts_dir, method)
+        best_value: Optional[float] = None
+        best_run: Optional[str] = None
+        for run_dir in run_dirs:
+            json_path = run_dir / "metrics.json"
+            if not json_path.exists():
+                continue
+            metrics = load_json(json_path)
+            values = metrics.get(metric_name)
+            if values is None:
+                continue
+            if isinstance(values, list):
+                if not values:
+                    continue
+                candidate = max(float(v) for v in values)
+            elif isinstance(values, (int, float)):
+                candidate = float(values)
+            else:
+                continue
+            if best_value is None or candidate > best_value:
+                best_value = candidate
+                best_run = run_dir.name
+        if best_value is not None and best_run is not None:
+            best_metrics[method] = (best_value, best_run)
+    return best_metrics
+
+
+def plot_best_metric_bars(
+    best_metrics: "OrderedDict[str, Tuple[float, str]]",
+    metric_name: str,
+    output_path: Path,
+) -> None:
+    if not best_metrics:
+        return
+    methods = list(best_metrics.keys())
+    values = [best_metrics[method][0] for method in methods]
+
+    plt.figure(figsize=(8, 4))
+    bars = plt.bar(methods, values, color="#7f8c8d")
+    pretty_metric = metric_name.replace("_", " ").title()
+    plt.title(f"Best {pretty_metric} by QAT Method")
+    plt.ylabel(pretty_metric)
+    plt.ylim(0.95, 0.99)
+    for bar, method in zip(bars, methods):
+        value, run_name = best_metrics[method]
+        plt.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f"{value:.3f}\n{run_name}",
+            ha="center",
+            va="bottom",
+        )
+    plt.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path)
+    plt.close()
+
+
 def collect_timing_runs(
     artifacts_dir: Path, methods: Iterable[str]
 ) -> List[tuple[str, Dict[str, float]]]:
@@ -223,6 +292,20 @@ def main() -> None:
         plot_loss_curves(method, run_dirs, method_out / f"{method}_losses.png")
         plot_metric_curves(
             method, run_dirs, method_out / f"{method}_metrics.png", base_metrics
+        )
+
+    best_metrics = collect_best_metrics(
+        artifacts_dir, args.methods, args.comparison_metric
+    )
+    if not best_metrics:
+        print(
+            f"[WARN] Could not find metric '{args.comparison_metric}' for the provided methods."
+        )
+    else:
+        plot_best_metric_bars(
+            best_metrics,
+            args.comparison_metric,
+            output_dir / f"best_{args.comparison_metric}.png",
         )
 
     timing_runs = collect_timing_runs(artifacts_dir, args.methods)
