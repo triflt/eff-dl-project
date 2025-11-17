@@ -1,3 +1,5 @@
+import copy
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -94,9 +96,7 @@ class LinearInt(nn.Linear):
     def __init__(self, in_features, out_features, w_scale, q_a, int_dtype, device='cpu'):
         super().__init__(in_features, out_features, bias=True, device=device)
         self.weight.requires_grad = False
-        self.weight.data = self.weight.data.to(int_dtype)
         self.bias.requires_grad = False
-        self.bias.data = self.bias.data.to(int_dtype)
         self.int_dtype = int_dtype
 
         self.w_scale = w_scale.to(device)
@@ -109,10 +109,18 @@ class LinearInt(nn.Linear):
         ).to(device)
         self.quantizer_act.s = nn.Parameter(q_a.s.to(device))
 
-    def forward(self, input_x):
-        act_q, act_scale = self.quantizer_act(input_x)
-        q_out = torch._int_mm(act_q.to(self.int_dtype), self.weight.T) + self.bias
-        return q_out * (act_scale * self.w_scale)
+    def forward(self, input_x, act_scale=None):
+        if act_scale is None:
+            act_q, act_scale = self.quantize_input(input_x)
+            act_q = act_q.to(self.int_dtype)
+        else:
+            act_q = input_x
+        
+        q_out = torch._int_mm(act_q, self.weight.T)
+        return q_out * (act_scale * self.w_scale) + self.bias
+
+    def quantize_input(self, input_x):
+        return self.quantizer_act(input_x)
 
     @classmethod
     def from_qat(cls, quantized_fc: QuantLinear, int_dtype: torch.dtype) -> "LinearInt":
@@ -121,5 +129,5 @@ class LinearInt(nn.Linear):
         weight_q, weight_scale = quantized_fc.quantizer_weight(quantized_fc.fc.weight.data)
         linear_int = cls(in_features, out_features, weight_scale, quantized_fc.quantizer_act, int_dtype)
         linear_int.weight.data = weight_q.to(int_dtype)
-        linear_int.bias.data = quantized_fc.fc.bias.data.to(int_dtype)
+        linear_int.bias.data = copy.deepcopy(quantized_fc.fc.bias.data.detach())
         return linear_int
