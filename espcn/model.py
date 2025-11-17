@@ -63,6 +63,16 @@ class ESPCN(nn.Module):
                 from pact.quant import QuantAct as QuantAct_PACT
                 feature_layers = _quantize_layers(feature_layers, QAConv2d_PACT, QuantAct_PACT, bits, quant_act)
                 subpixel_layers = _quantize_layers(subpixel_layers, QAConv2d_PACT, QuantAct_PACT, bits, quant_act, insert_act_before_pixelshuffle=True)
+            elif method == "apot":
+                from apot.quant import QAConv2d as QAConv2d_APoT
+                from apot.quant import QuantAct as QuantAct_APoT
+                feature_layers = _quantize_layers(feature_layers, QAConv2d_APoT, QuantAct_APoT, bits, quant_act)
+                subpixel_layers = _quantize_layers(subpixel_layers, QAConv2d_APoT, QuantAct_APoT, bits, quant_act, insert_act_before_pixelshuffle=True)
+            elif method == "efficientqat":
+                from efficientqat.quant import QAConv2d as QAConv2d_EfficientQAT
+                from efficientqat.quant import QuantAct as QuantAct_EfficientQAT
+                feature_layers = _quantize_layers(feature_layers, QAConv2d_EfficientQAT, QuantAct_EfficientQAT, bits, quant_act)
+                subpixel_layers = _quantize_layers(subpixel_layers, QAConv2d_EfficientQAT, QuantAct_EfficientQAT, bits, quant_act, insert_act_before_pixelshuffle=True)
             else:
                 raise ValueError(f"Unsupported QAT method: {method}")
 

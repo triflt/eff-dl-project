@@ -7,3 +7,6 @@ torchvision
 scipy
 tensorboard
 natsort
+onnx
+onnxruntime
+onnxscript

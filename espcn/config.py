@@ -42,11 +42,11 @@ upscale_factor = 4
 # Current configuration parameter method
 mode = "train"
 # Experiment name, easy to save weights and log files
-exp_name = "ESPCN_x4-T91-LSQ-FXQAT"
+exp_name = "ESPCN_x4-T91-EFFICIENTQAT-QAT"
 
 # QAT configuration
-qat_enabled = False
-qat_method = "lsq"  # "lsq" | "pact"
+qat_enabled = True
+qat_method = "efficientqat"  # "lsq" | "pact"
 qat_bits = 8
 qat_quantize_activations = True
 # PACT alpha regularization strength (set to 0.0 to disable)
@@ -65,7 +65,7 @@ if mode == "train":
 
     # The address to load the pretrained model
     # LSQ-QAT checkpoint (for LSQ→FX-QAT initialization)
-    pretrained_model_weights_path = "./results/ESPCN_x4-T91-LSQ-QAT/g_best.pth.tar"
+    pretrained_model_weights_path = "./results/ESPCN_x4-T91/g_last.pth.tar"
     model_weights_path = "./results/ESPCN_x4-T91/g_last.pth.tar"
     # Incremental training and migration training
     resume_model_weights_path = f""
