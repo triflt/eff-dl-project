@@ -12,6 +12,11 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import matplotlib.pyplot as plt
 
 QAT_METHODS = ["lsq", "pact", "adaround", "apot", "efficientqat"]
+METRIC_LABELS = {
+    "train_auc": "Train ROC-AUC",
+    "qat_auc": "QAT ROC-AUC",
+    "quantized_auc": "Quantized ROC-AUC",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--comparison-metric",
-        default="quantized_acc",
+        default="quantized_auc",
         help="Metric key to use when comparing the best run for each QAT method.",
     )
     return parser.parse_args()
@@ -92,11 +97,11 @@ def plot_loss_curves(method: str, run_dirs: Sequence[Path], output_path: Path) -
 
 
 def load_base_metrics(artifacts_dir: Path) -> float:
-    """Return the final recorded metric value from the baseline run."""
+    """Return the final recorded ROC-AUC value from the baseline run."""
     base_metrics: Dict[str, float] = {}
     metrics_path = artifacts_dir / "base" / "metrics.json"
     if not metrics_path.exists():
-        return base_metrics
+        return 0.5
 
     raw_metrics = load_json(metrics_path)
     for name, values in raw_metrics.items():
@@ -106,14 +111,14 @@ def load_base_metrics(artifacts_dir: Path) -> float:
             base_metrics[name] = float(values[-1])
         elif isinstance(values, (int, float)):
             base_metrics[name] = float(values)
-    return base_metrics['train_acc']
+    return base_metrics.get("train_auc", 0.5)
 
 
 def plot_metric_curves(
     method: str,
     run_dirs: Sequence[Path],
     output_path: Path,
-    base_metrics: float,
+    base_metric_value: float,
 ) -> None:
     metric_series: Dict[str, List[tuple[str, List[int], List[float]]]] = OrderedDict()
 
@@ -140,10 +145,13 @@ def plot_metric_curves(
     for ax, metric_name in zip(axes.flatten(), metric_names):
         for label, xs, ys in sorted(metric_series[metric_name], key=lambda item: item[0]):
             ax.scatter(xs, ys, label=label)
-        ax.scatter([1], [base_metrics], label="base", marker="x", color="black")
-        ax.set_title(f"{method.upper()} {metric_name}")
+        ax.scatter([1], [base_metric_value], label="base", marker="x", color="black")
+        pretty_metric = METRIC_LABELS.get(
+            metric_name, metric_name.replace("_", " ").title()
+        )
+        ax.set_title(f"{method.upper()} {pretty_metric}")
         ax.set_xlabel("Epoch")
-        ax.set_ylabel(metric_name)
+        ax.set_ylabel(pretty_metric)
         ax.grid(True, alpha=0.3)
         ax.legend()
 
@@ -198,10 +206,12 @@ def plot_best_metric_bars(
 
     plt.figure(figsize=(8, 4))
     bars = plt.bar(methods, values, color="#7f8c8d")
-    pretty_metric = metric_name.replace("_", " ").title()
+    pretty_metric = METRIC_LABELS.get(
+        metric_name, metric_name.replace("_", " ").title()
+    )
     plt.title(f"Best {pretty_metric} by QAT Method")
     plt.ylabel(pretty_metric)
-    plt.ylim(0.95, 0.99)
+    plt.ylim(0.5, 1.0)
     for bar, method in zip(bars, methods):
         value, run_name = best_metrics[method]
         plt.text(
@@ -281,7 +291,7 @@ def main() -> None:
     artifacts_dir = args.artifacts_dir.resolve()
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    base_metrics = load_base_metrics(artifacts_dir)
+    base_metric_value = load_base_metrics(artifacts_dir)
 
     for method in args.methods:
         run_dirs = iter_method_runs(artifacts_dir, method)
@@ -291,7 +301,10 @@ def main() -> None:
         method_out = output_dir / method
         plot_loss_curves(method, run_dirs, method_out / f"{method}_losses.png")
         plot_metric_curves(
-            method, run_dirs, method_out / f"{method}_metrics.png", base_metrics
+            method,
+            run_dirs,
+            method_out / f"{method}_metrics.png",
+            base_metric_value,
         )
 
     best_metrics = collect_best_metrics(

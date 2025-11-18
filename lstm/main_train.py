@@ -11,6 +11,7 @@ from typing import Any, Optional
 import requests
 import torch
 import torch.nn as nn
+from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm.auto import tqdm
 
@@ -119,12 +120,6 @@ def collate_batch(batch, pad_idx):
     return padded, lengths, labels
 
 
-def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
-    predictions = logits.argmax(dim=1)
-    correct = (predictions == targets).sum().item()
-    return correct / targets.size(0)
-
-
 def save_loss_series(
     train_losses: list[float],
     train_steps: list[int],
@@ -170,7 +165,8 @@ def train_epoch(
 def evaluate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module, device: torch.device) -> tuple[float, float]:
     model.eval()
     epoch_loss = 0.0
-    epoch_acc = 0.0
+    prob_chunks: list[torch.Tensor] = []
+    label_chunks: list[torch.Tensor] = []
     for inputs, lengths, labels in tqdm(dataloader):
         if inputs.shape[0] <= 16:
             continue
@@ -178,10 +174,25 @@ def evaluate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module, dev
         logits = model(inputs, lengths)
         loss = criterion(logits, labels)
         epoch_loss += loss.item() * inputs.size(0)
-        epoch_acc += accuracy(logits, labels) * inputs.size(0)
+
+        probs = torch.softmax(logits, dim=1)[:, 1]
+        prob_chunks.append(probs.detach().cpu())
+        label_chunks.append(labels.detach().cpu())
 
     dataset_size = len(dataloader.dataset)
-    return epoch_loss / dataset_size, epoch_acc / dataset_size
+    if prob_chunks and label_chunks:
+        labels_tensor = torch.cat(label_chunks)
+        probs_tensor = torch.cat(prob_chunks)
+        if labels_tensor.unique().numel() < 2:
+            epoch_auc = 0.5
+        else:
+            epoch_auc = float(
+                roc_auc_score(labels_tensor.numpy(), probs_tensor.numpy())
+            )
+    else:
+        epoch_auc = 0.5
+
+    return epoch_loss / dataset_size, epoch_auc
 
 
 def prepare_dataset(train_ratio: float = TRAIN_RATIO) -> tuple[list[tuple[int, str]], list[tuple[int, str]], dict[str, Any]]:
@@ -263,7 +274,7 @@ def train_base_model(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
 
     timings = {"train": 0.0, "infer": 0.0}
-    metrics = {"train_acc": []}
+    metrics = {"train_auc": []}
     losses = {"train": []}
 
     for epoch in range(1, epochs + 1):
@@ -273,13 +284,13 @@ def train_base_model(
         losses["train"].extend(batch_losses)
 
         start_time = time.perf_counter()
-        val_loss, val_acc = evaluate(model, dl_test, criterion, device)
+        val_loss, val_auc = evaluate(model, dl_test, criterion, device)
         timings["infer"] += time.perf_counter() - start_time
-        metrics["train_acc"].append(val_acc)
+        metrics["train_auc"].append(val_auc)
 
         print(
             f"Epoch {epoch:02d} | train_loss={train_loss:.4f} | "
-            f"val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%"
+            f"val_loss={val_loss:.4f} | val_auc={val_auc:.3f}"
         )
 
     return model, tokenizer, timings, metrics, losses
@@ -306,7 +317,7 @@ def train_qat_models(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
 
     timings = {"qat_train": 0.0, "qat_infer": 0.0, "quantized_infer": 0.0}
-    metrics = {"qat_acc": [], "quantized_acc": []}
+    metrics = {"qat_auc": [], "quantized_auc": []}
     losses = {"qat_train": [], "quantized_eval": []}
     final_quantized_model: Optional[nn.Module] = None
 
@@ -319,22 +330,22 @@ def train_qat_models(
         losses["qat_train"].extend(batch_losses)
 
         start_time = time.perf_counter()
-        val_loss, val_acc = evaluate(model_qat, dl_test, criterion, device)
+        val_loss, val_auc = evaluate(model_qat, dl_test, criterion, device)
         timings["qat_infer"] += time.perf_counter() - start_time
-        metrics["qat_acc"].append(val_acc)
+        metrics["qat_auc"].append(val_auc)
         print(
             f"QAT Epoch {epoch:02d} | train_loss={train_loss:.4f} | "
-            f"val_loss={val_loss:.4f} | val_acc={val_acc*100:.1f}%"
+            f"val_loss={val_loss:.4f} | val_auc={val_auc:.3f}"
         )
 
         quantized_model = model_qat.quantize(bits=8, linear_int_class=qat_dict[qat_method]['li'])
         quantized_model.to(device)
         start_time = time.perf_counter()
-        q_val_loss, q_val_acc = evaluate(quantized_model, dl_test, criterion, device)
+        q_val_loss, q_val_auc = evaluate(quantized_model, dl_test, criterion, device)
         timings["quantized_infer"] += time.perf_counter() - start_time
-        metrics["quantized_acc"].append(q_val_acc)
+        metrics["quantized_auc"].append(q_val_auc)
         losses["quantized_eval"].append(q_val_loss)
-        print(f"Quantized Epoch {epoch:02d} | val_loss={q_val_loss:.4f} | val_acc={q_val_acc*100:.1f}%")
+        print(f"Quantized Epoch {epoch:02d} | val_loss={q_val_loss:.4f} | val_auc={q_val_auc:.3f}")
         final_quantized_model = quantized_model
 
     return final_quantized_model, timings, metrics, losses
