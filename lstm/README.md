@@ -41,7 +41,7 @@ EfficientQAT:
 Overall:
 ![train](plots/timings/train.png)
 ![infer](plots/timings/infer.png)
-![qa](quantized_infer/timings/quantized_infer.png)
+![qa](plots/timings/quantized_infer.png)
 
 Выводы:
 * Квантизация занимает много времени замедляя train и inference
